@@ -4,6 +4,14 @@ Autonomous maze-solving robot built with an ESP32-S3. Uses ultrasonic and ToF se
 
 Work in progress.
 
+![MazeRunner Overview](images/top.png)
+
+## Gallery
+
+| Front (LED Eyes) | Side (ToF Sensor) | Perspective |
+|:---:|:---:|:---:|
+| ![Front](images/front.png) | ![Side](images/right.png) | ![Perspective 2](images/top2.png) |
+
 ## Schematic
 
 ![Schematic](schematic.png)
