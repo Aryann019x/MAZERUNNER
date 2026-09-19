@@ -1,0 +1,37 @@
+# PlatformIO build artifacts
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# IDE / editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sixth AI / agent artifacts
+.sixth/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+
+# OS files
+Thumbs.db
+.DS_Store
+Desktop.ini
+
+# Build outputs
+*.elf
+*.bin
+*.hex
+build/
+
+# Old backup/scratch files (not part of the clean project)
+mainoldog.cpp
+main_v5_backup.cpp
+aksflask.cpp

@@ -1,0 +1,17 @@
+Reference,Qty,Part,Description,Suggested Source / Part Number,Notes
+ESP32-BOARD,1,ESP32-S3-DevKitC-1,ESP32-S3 development board,Espressif / any DevKitC-1,USB power and programming
+OLED,1,SSD1306 128x64,I2C OLED display,Adafruit 938,Connect to I2C SDA/SCL
+MPU6050,1,Adafruit MPU6050,Accelerometer + gyro,I2C module,Connect to I2C SDA/SCL
+VL53L0X,2,VL53L0X Time-of-Flight sensor,ToF range sensor,Pololu 2490 / ST module,Use XSHUT pins to give unique addresses
+ULTRASONIC,1,HC-SR04 or similar,Ultrasonic distance sensor,Generic HC-SR04,Trig/Echo pins
+MOTOR_DRIVER,1,H-bridge (e.g., TB6612 or L298),Dual motor driver module,Pololu TB6612 or L298N,Connect AIN/BIN/EN/STBY pins
+DC_MOTOR,2,DC Gear Motor,12V (or matching battery) geared motors,Generic,Match motor driver and battery voltage
+NEOPIXEL,1,WS2812/NeoPixel LED,Single RGB LED,Adafruit NeoPixel,Data pin to `NEOPIXEL_PIN`
+BUZZER,1,Active buzzer,Passive/active piezo buzzer,Generic,Buzzer driven with PWM tone
+BUTTON,2,Tactile pushbutton,Momentary pushbutton,Generic,Use with INPUT_PULLUP
+JUMPER,~10,Jumper wires,Assorted male/female jumper wires,Generic,For prototyping
+POWER,1,5V USB supply or battery,USB power bank or regulated battery,Generic,Ensure common ground with motors
+CAPACITORS,2,Decoupling capacitors,10uF/100uF recommended,Generic,Across motor supply and logic as needed
+RESISTOR,2,Level-shift/pull-up resistors,10k pull-ups for buttons or sensors,Generic,Only if needed
+PCB/BREADBOARD,1,Breadboard or perfboard,Prototyping board,Generic,Optional for wiring
+CONNECTOR,1,Motor terminal block,Screw terminals for motors,Generic,Optional
