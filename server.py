@@ -10,14 +10,15 @@ def ask():
         return jsonify({"response": "No question received."})
 
     try:
-        # Expecting local Ollama installed + configured.
-        # Use a shell-less subprocess call for safety.
+        # Local Ollama model tuned for speed: qwen2.5:3b fits fully in
+        # 4GB VRAM and answers in seconds. Prompt forces short replies.
+        prompt = "Answer briefly in at most 3 short sentences. " + question
         result = subprocess.run(
-            ["ollama", "run", "mistral"],
-            input=question.encode("utf-8"),
+            ["ollama", "run", "qwen2.5:3b"],
+            input=prompt.encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=60,
+            timeout=45,
             check=False,
         )
 

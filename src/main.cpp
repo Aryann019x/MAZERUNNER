@@ -8,6 +8,19 @@
 #include <VL53L0X.h>
 #include <math.h>
 #include "pitches.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <driver/i2s.h>
+
+// Local creds live in include/wifi_config.h (untracked). Empty = AP only.
+#if __has_include("wifi_config.h")
+#include "wifi_config.h"
+#else
+#define WIFI_SSID ""
+#define WIFI_PASS ""
+#define AP_SSID "MazeRunner"
+#define AP_PASS "mazerunner123"
+#endif
 
 // Pin definitions
 #define AIN1 2
@@ -34,6 +47,15 @@
 #define LOX1_ADDR 0x30
 #define LOX2_ADDR 0x31
 
+// INMP441 mic (same wiring as the MIC test board): VDD->3V3, GND->GND,
+// SD->12, WS->11, SCK->10, L/R->GND. 10/11/12 are free on this bot.
+#define I2S_WS 11
+#define I2S_SCK 10
+#define I2S_SD 12
+#define I2S_PORT I2S_NUM_0
+#define I2S_SAMPLE_RATE 16000
+#define I2S_READ_SAMPLES 128
+
 const int pwmChannelA = 0, pwmChannelB = 1, buzzerChannel = 2;
 const int pwmFreq = 5000, pwmRes = 8;
 const unsigned long turn90Time = 190;
@@ -58,9 +80,10 @@ int melodyIndex = 0;
 unsigned long noteStart = 0;
 int noteLength = 0;
 
-// Page 0 = Welcome, 1 = Greeting, 2 = Eyes, 3 = Autonomous Drive, 4 = Pose Telemetry
-const uint8_t totalPages = 5;
-const char* pageNames[totalPages - 1] = {"Greetings", "Eyes", "Autonomous Drive", "Pose Telemetry"};
+// Page 0 = Welcome, 1 = Greeting, 2 = Eyes, 3 = Autonomous Drive, 4 = Pose Telemetry, 5 = Voice
+const uint8_t totalPages = 6;
+const char* pageNames[totalPages - 1] = {"Greetings", "Eyes", "Autonomous Drive", "Pose Telemetry", "Voice"};
+const uint8_t VOICE_PAGE = 5;
 uint8_t currentPage = 0;
 
 VL53L0X sensorLeft;
@@ -72,6 +95,26 @@ uint16_t distRight = 65535;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 Adafruit_NeoPixel pixels(NEOPIXEL_NUM, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_MPU6050 mpu;
+WebServer webServer(80);
+
+// -------------------- Web control state --------------------
+int webSpeed = 150; // 0..255, set from the site slider
+String lastVoiceText = ""; // last YOU/AI text from the PC script, shown on site + voice page
+String botIP = "no wifi";
+
+// -------------------- Voice page state --------------------
+static int16_t *voiceBuf = nullptr;
+static size_t voiceCap = 0; // samples
+static size_t voiceLen = 0;
+static bool voiceRec = false;
+static unsigned long voiceRecStart = 0;
+// PSRAM (if the board has it) allows long holds, otherwise cap at 8s (256KB).
+static size_t voiceMaxSec() { return psramFound() ? 30 : 8; }
+enum VoiceStatus { V_IDLE, V_RECORDING, V_WAITING, V_RESULT, V_NOLINK };
+VoiceStatus voiceStatus = V_IDLE;
+unsigned long voiceWaitStart = 0;
+String voiceHeard = ""; // what Vosk heard
+String voiceReply = ""; // what ollama answered
 
 // -------------------- Non-blocking turn state --------------------
 enum TurnState { TURN_NONE, TURNING_LEFT, TURNING_RIGHT };
@@ -139,6 +182,21 @@ void updateOLEDVL53(float front, uint16_t left, uint16_t right, const char* moto
 void calibrateGyroBias();
 void updatePose();
 void predictPosition(float secondsAhead, float &predX, float &predY);
+void showVoicePage();
+void setupWifi();
+void setupWeb();
+void handleWebRoot();
+void handleWebCmd();
+void handleWebSpeed();
+void handleWebSensors();
+void webBurst(const String& dir);
+bool initMic();
+void voiceStart();
+void voiceCapture();
+void voiceCancel();
+void voiceFinishSend();
+void pollSerialReply();
+void showWrapped(const String& title, const String& body);
 
 void setup() {
   Serial.begin(115200);
@@ -197,6 +255,10 @@ void setup() {
   calibrateGyroBias();
   lastPoseMicros = micros();
 
+  initMic(); // ok to fail, voice page just reports it
+  setupWifi(); // STA first, own AP if that fails
+  setupWeb();
+
   beep(2);
   currentPage=0;
   showWelcomePage();
@@ -213,6 +275,7 @@ void loop() {
 
   if(btn1 == LOW && prevBtn1 == HIGH) {
     beep(1);
+    if (voiceRec) voiceCancel(); // leaving the page mid-record drops it
     currentPage = (currentPage + 1) % totalPages;
     display.clearDisplay();
 
@@ -226,6 +289,7 @@ void loop() {
         break;
       case 3: break; // Autonomous Drive renders itself continuously below
       case 4: showPosePage(); break;
+      case 5: voiceStatus = V_IDLE; showVoicePage(); break;
     }
     delay(250);
   }
@@ -250,9 +314,24 @@ void loop() {
     ultrasonicHybridDrive();
   } else if(currentPage == 4) {
     showPosePage();
+  } else if(currentPage == VOICE_PAGE) {
+    // BTN2 hold-to-talk: record while held, send on release.
+    if (btn2 == LOW && !voiceRec && voiceStatus != V_WAITING) {
+      voiceStart();
+    }
+    if (voiceRec) {
+      voiceCapture();
+      if (btn2 == HIGH) voiceFinishSend(); // released
+    }
+    if (voiceStatus == V_WAITING && millis() - voiceWaitStart > 30000) {
+      voiceStatus = V_NOLINK; // PC script not running
+    }
+    if (!voiceRec) showVoicePage();
   } else {
     stopMotors();
   }
+  webServer.handleClient(); // control site, cheap to poll
+  pollSerialReply(); // TXTHDR answers from the PC script, any page
 }
 
 // -------------------- Eyes functions --------------------
@@ -679,4 +758,300 @@ void predictPosition(float secondsAhead, float &predX, float &predY) {
   float headingRad = pose.heading * PI / 180.0f;
   predX = pose.x + speed * secondsAhead * cos(headingRad);
   predY = pose.y + speed * secondsAhead * sin(headingRad);
+}
+
+// -------------------- WiFi (STA first, own AP as fallback) --------------------
+void setupWifi() {
+  botIP = "no wifi";
+  String ssid = WIFI_SSID;
+  if (ssid.length() && ssid != "YOUR_WIFI_NAME") {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.printf("wifi: joining '%s'...\n", WIFI_SSID);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) delay(500);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    botIP = WiFi.localIP().toString();
+    Serial.printf("wifi ok: %s\n", botIP.c_str());
+  } else {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    botIP = WiFi.softAPIP().toString();
+    Serial.printf("AP up: '%s' ip %s\n", AP_SSID, botIP.c_str());
+  }
+}
+
+// -------------------- Control website --------------------
+String escHtml(const String& s) {
+  String o = s;
+  o.replace("&", "&amp;");
+  o.replace("<", "&lt;");
+  o.replace(">", "&gt;");
+  return o;
+}
+
+void handleWebRoot() {
+  String h = "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  h += "<style>body{font-family:sans-serif;text-align:center}td{padding:6px}a.btn{display:block;padding:14px 22px;background:#222;color:#fff;text-decoration:none;border-radius:8px;font-size:20px}</style></head><body>";
+  h += "<h2>MazeRunner</h2>";
+  h += "<table align='center'><tr><td></td><td><a class='btn' href='/cmd?dir=F'>F</a></td><td></td></tr>";
+  h += "<tr><td><a class='btn' href='/cmd?dir=L'>L</a></td><td><a class='btn' href='/cmd?dir=S'>STOP</a></td><td><a class='btn' href='/cmd?dir=R'>R</a></td></tr>";
+  h += "<tr><td></td><td><a class='btn' href='/cmd?dir=B'>B</a></td><td></td></tr></table>";
+  h += "<form action='/speed'>Speed <input type='range' name='v' min='0' max='255' value='" + String(webSpeed) + "'>";
+  h += "<input type='submit' value='Set'></form>";
+  h += "<p>Sensors: <span id='s'>...</span></p>";
+  h += "<p>Last voice: <b>" + escHtml(lastVoiceText) + "</b></p>";
+  h += "<script>setInterval(async()=>{try{const r=await fetch('/sensors');const j=await r.json();document.getElementById('s').textContent=j.front+'cm / '+j.left+'mm / '+j.right+'mm';}catch(e){}},1000);</script>";
+  h += "</body></html>";
+  webServer.send(200, "text/html", h);
+}
+
+void webBurst(const String& dir) {
+  if (dir == "F") { moveForward(webSpeed, webSpeed); delay(600); }
+  else if (dir == "B") { moveBackward(webSpeed, webSpeed); delay(600); }
+  else if (dir == "L") { turnLeftStart(webSpeed, webSpeed); delay(250); }
+  else if (dir == "R") { turnRightStart(webSpeed, webSpeed); delay(250); }
+  stopMotors();
+}
+
+void handleWebCmd() {
+  webBurst(webServer.arg("dir"));
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+void handleWebSpeed() {
+  webSpeed = constrain(webServer.arg("v").toInt(), 0, 255);
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+void handleWebSensors() {
+  uint16_t l = sensorLeft.readRangeContinuousMillimeters();
+  uint16_t r = sensorRight.readRangeContinuousMillimeters();
+  if (sensorLeft.timeoutOccurred()) l = 65535;
+  if (sensorRight.timeoutOccurred()) r = 65535;
+  readUltrasonic();
+  String j = "{\"front\":" + String(distanceFront, 1) + ",\"left\":" + String(l) +
+             ",\"right\":" + String(r) + "}";
+  webServer.send(200, "application/json", j);
+}
+
+void setupWeb() {
+  webServer.on("/", handleWebRoot);
+  webServer.on("/cmd", handleWebCmd);
+  webServer.on("/speed", handleWebSpeed);
+  webServer.on("/sensors", handleWebSensors);
+  webServer.begin();
+  Serial.println("web site up on port 80");
+}
+
+// -------------------- Mic (INMP441 over I2S) --------------------
+static bool micOk = false;
+
+bool initMic() {
+  i2s_config_t cfg = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = I2S_SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // L/R tied to GND
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 64,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+  i2s_pin_config_t pins = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD
+  };
+  if (i2s_driver_install(I2S_PORT, &cfg, 0, NULL) != ESP_OK) return false;
+  if (i2s_set_pin(I2S_PORT, &pins) != ESP_OK) return false;
+  i2s_zero_dma_buffer(I2S_PORT);
+  micOk = true;
+  Serial.println("mic ready: SCK=10 WS=11 SD=12 @16kHz");
+  return true;
+}
+
+// -------------------- Voice page --------------------
+void showWrapped(const String& title, const String& body) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(title);
+  int x = 0, y = 10;
+  String word = "";
+  auto flushWord = [&]() {
+    if (!word.length()) return;
+    int w = word.length() * 6;
+    if (x + w > SCREEN_WIDTH) { x = 0; y += 9; }
+    if (y > SCREEN_HEIGHT - 9) return;
+    display.setCursor(x, y);
+    display.print(word);
+    x += w + 6;
+    word = "";
+  };
+  for (unsigned i = 0; i < body.length(); i++) {
+    char c = body[i];
+    if (c == ' ' || c == '\n') flushWord();
+    else word += c;
+    if (c == '\n') { x = 0; y += 9; }
+    if (y > SCREEN_HEIGHT - 9) break;
+  }
+  flushWord();
+  display.display();
+}
+
+void showVoicePage() {
+  if (!micOk) {
+    showWrapped("VOICE", "mic init failed. check wiring: SCK=10 WS=11 SD=12");
+    return;
+  }
+  if (voiceStatus == V_RECORDING) return; // progress drawn by voiceCapture
+  if (voiceStatus == V_WAITING) {
+    showWrapped("VOICE", "thinking... (PC transcribes + asks ollama)");
+    return;
+  }
+  if (voiceStatus == V_NOLINK) {
+    showWrapped("VOICE", "no reply. start mazerunner_voice.py on the PC, then hold BTN2 again.");
+    return;
+  }
+  if (voiceStatus == V_RESULT) {
+    String both = voiceHeard;
+    if (voiceReply.length()) both += String("\nAI: ") + voiceReply;
+    showWrapped("YOU SAID", both);
+    return;
+  }
+  // idle
+  String msg = "Hold BTN2, speak, release.\nIP: " + botIP;
+  if (lastVoiceText.length()) msg += String("\nLast: ") + lastVoiceText;
+  showWrapped("VOICE", msg);
+}
+
+void voiceStart() {
+  if (!micOk) return;
+  size_t maxSamples = voiceMaxSec() * I2S_SAMPLE_RATE;
+  if (voiceBuf) { free(voiceBuf); voiceBuf = nullptr; }
+  voiceBuf = (int16_t *)malloc(maxSamples * sizeof(int16_t));
+  if (!voiceBuf) {
+    voiceStatus = V_IDLE;
+    showWrapped("VOICE", "out of memory for recording");
+    return;
+  }
+  voiceCap = maxSamples;
+  voiceLen = 0;
+  voiceRec = true;
+  voiceRecStart = millis();
+  voiceStatus = V_RECORDING;
+  i2s_zero_dma_buffer(I2S_PORT);
+  Serial.println("voice: recording, release BTN2 to send");
+}
+
+void voiceCapture() {
+  if (!voiceRec || !voiceBuf) return;
+  int32_t tmp[I2S_READ_SAMPLES];
+  size_t got = 0;
+  if (i2s_read(I2S_PORT, tmp, sizeof(tmp), &got, pdMS_TO_TICKS(20)) == ESP_OK) {
+    size_t n = got / sizeof(int32_t);
+    for (size_t i = 0; i < n && voiceLen < voiceCap; i++) {
+      int32_t s = tmp[i] >> 11;
+      if (s > 32767) s = 32767;
+      if (s < -32768) s = -32768;
+      voiceBuf[voiceLen++] = (int16_t)s;
+    }
+  }
+  if (voiceLen >= voiceCap) { voiceFinishSend(); return; } // hit the cap
+  static unsigned long lastProg = 0;
+  if (millis() - lastProg > 300) {
+    lastProg = millis();
+    int secs = (millis() - voiceRecStart) / 1000;
+    int pct = voiceCap ? (int)(100 * voiceLen / voiceCap) : 0;
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("LISTENING...");
+    display.drawRect(0, 20, 110, 10, SSD1306_WHITE);
+    display.fillRect(1, 21, constrain(pct * 108 / 100, 0, 108), 8, SSD1306_WHITE);
+    display.setCursor(0, 40);
+    display.printf("%ds - release BTN2", secs);
+    display.display();
+  }
+}
+
+void voiceCancel() {
+  voiceRec = false;
+  if (voiceBuf) { free(voiceBuf); voiceBuf = nullptr; }
+  voiceCap = voiceLen = 0;
+  voiceStatus = V_IDLE;
+}
+
+void voiceFinishSend() {
+  voiceRec = false;
+  uint32_t n = (uint32_t)(voiceLen * sizeof(int16_t));
+  Serial.print("AUDHDR");
+  Serial.write((const uint8_t *)&n, 4);
+  Serial.flush();
+  const uint8_t *p = (const uint8_t *)voiceBuf;
+  size_t left = n;
+  while (left) {
+    size_t chunk = left > 512 ? 512 : left;
+    size_t w = Serial.write(p, chunk);
+    if (w == 0) break;
+    p += w; left -= w;
+  }
+  Serial.println();
+  Serial.printf("AUDEND %u\n", (unsigned)n);
+  voiceStatus = V_WAITING;
+  voiceWaitStart = millis();
+  showVoicePage();
+}
+
+// PC answers "TXTHDR" + uint32le len + utf8 ("YOU: ...\nAI: ..."). Runs every loop.
+void pollSerialReply() {
+  static uint8_t stage = 0; // 0 = magic, 1 = len, 2 = payload
+  static uint8_t mi = 0, li = 0;
+  static uint32_t tlen = 0;
+  static String payload = "";
+  const char *magic = "TXTHDR";
+  while (Serial.available()) {
+    uint8_t c = Serial.read();
+    if (stage == 0) {
+      if (c == magic[mi]) { mi++; if (mi == 6) { stage = 1; li = 0; tlen = 0; } }
+      else mi = (c == magic[0]) ? 1 : 0;
+    } else if (stage == 1) {
+      tlen |= ((uint32_t)c << (8 * li)); li++;
+      if (li == 4) {
+        if (tlen > 512) tlen = 512;
+        payload = "";
+        if (tlen == 0) { stage = 0; mi = 0; }
+        else stage = 2;
+      }
+    } else {
+      payload += (char)c;
+      if (payload.length() >= tlen) {
+        int k = payload.indexOf("\nAI:");
+        if (k >= 0) {
+          voiceHeard = payload.substring(0, k);
+          voiceReply = payload.substring(k + 4);
+        } else {
+          voiceHeard = payload;
+          voiceReply = "";
+        }
+        voiceHeard.trim(); voiceReply.trim();
+        voiceHeard.replace("YOU:", "");
+        voiceHeard.trim();
+        lastVoiceText = voiceHeard + (voiceReply == "" ? "" : " -> " + voiceReply);
+        voiceStatus = V_RESULT;
+        if (currentPage == VOICE_PAGE) showVoicePage();
+        stage = 0; mi = 0;
+      }
+    }
+  }
 }

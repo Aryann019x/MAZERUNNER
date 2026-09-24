@@ -35,3 +35,8 @@ build/
 mainoldog.cpp
 main_v5_backup.cpp
 aksflask.cpp
+
+# Local wifi creds (fill in include/wifi_config.h locally, never commit)
+include/wifi_config.h
+capture_*.wav
+voice_*.wav
