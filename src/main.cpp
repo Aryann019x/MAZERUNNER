@@ -8,6 +8,7 @@
 #include <VL53L0X.h>
 #include <math.h>
 #include "pitches.h"
+#include "nn_policy.h"
 #include <WiFi.h>
 #include <WebServer.h>
 #include <driver/i2s.h>
@@ -80,10 +81,12 @@ int melodyIndex = 0;
 unsigned long noteStart = 0;
 int noteLength = 0;
 
-// Page 0 = Welcome, 1 = Greeting, 2 = Eyes, 3 = Autonomous Drive, 4 = Pose Telemetry, 5 = Voice
-const uint8_t totalPages = 6;
-const char* pageNames[totalPages - 1] = {"Greetings", "Eyes", "Autonomous Drive", "Pose Telemetry", "Voice"};
-const uint8_t VOICE_PAGE = 5;
+// Page 0 = Welcome, 1 = Greeting, 2 = Eyes, 3 = Autonomous Drive,
+// 4 = Pose Telemetry, 5 = Neural Drive, 6 = Voice
+const uint8_t totalPages = 7;
+const char* pageNames[totalPages - 1] = {"Greet", "Eyes", "Drive", "Pose", "Neural", "Voice"};
+const uint8_t NEURAL_PAGE = 5;
+const uint8_t VOICE_PAGE = 6;
 uint8_t currentPage = 0;
 
 VL53L0X sensorLeft;
@@ -134,6 +137,7 @@ struct RobotPose {
 RobotPose pose;
 
 float gyroZBiasDegPerSec = 0;
+float gyroYawRate = 0; // deg/s, filtered gyro z, used by the neural page
 unsigned long lastPoseMicros = 0;
 
 // TUNE THESE: run moveForward(forwardSpeed,forwardSpeed) for exactly 2s on a
@@ -144,6 +148,10 @@ const float BACKWARD_SPEED_MM_S = 250.0;
 
 enum DriveState { DRIVE_STOPPED, DRIVE_FORWARD, DRIVE_BACKWARD, DRIVE_TURNING };
 DriveState driveState = DRIVE_STOPPED;
+
+// Neural page state
+static float nnOutL = 0, nnOutR = 0;
+static float nnPrevL = 800, nnPrevR = 800;
 
 // Debounce: require N consecutive "obstacle" readings before acting on them.
 // A single glitchy VL53L0X reading (crosstalk between the two side sensors,
@@ -174,6 +182,9 @@ void updateEyesWithMPU();
 void showWelcomePage();
 void showGreetingPage();
 void showPosePage();
+void showNeuralPage();
+void neuralDrive();
+void setWheels(int left, int right);
 void ultrasonicHybridDrive();
 void sensorPowerDown(int pin);
 void sensorPowerUp(int pin);
@@ -310,6 +321,8 @@ void loop() {
     ultrasonicHybridDrive();
   } else if(currentPage == 4) {
     showPosePage();
+  } else if(currentPage == NEURAL_PAGE) {
+    neuralDrive();
   } else if(currentPage == VOICE_PAGE) {
     // BTN2 hold-to-talk: record while held, send on release.
     // A quick tap (<400ms) exits to the next page instead — BTN1/GPIO0
@@ -356,7 +369,12 @@ void advancePage() {
       break;
     case 3: break; // Autonomous Drive renders itself continuously below
     case 4: showPosePage(); break;
-    case 5: voiceStatus = V_IDLE; ensureMic(); showVoicePage(); break;
+    case 5:
+      nnOutL = nnOutR = 0;
+      nnPrevL = nnPrevR = 800;
+      showNeuralPage();
+      break;
+    case 6: voiceStatus = V_IDLE; ensureMic(); showVoicePage(); break;
   }
   delay(250);
 }
@@ -523,6 +541,25 @@ void stopMotors() {
   turnState = TURN_NONE;
 }
 
+// Direct wheel speeds, negative = backwards. Used by the neural page where
+// the two sides move independently instead of the usual forward/turn calls.
+void setWheels(int left, int right) {
+  left = constrain(left, -255, 255);
+  right = constrain(right, -255, 255);
+  digitalWrite(STBY, HIGH);
+  digitalWrite(AIN1, left >= 0 ? HIGH : LOW);
+  digitalWrite(AIN2, left >= 0 ? LOW : HIGH);
+  digitalWrite(BIN1, right >= 0 ? HIGH : LOW);
+  digitalWrite(BIN2, right >= 0 ? LOW : HIGH);
+  ledcWrite(pwmChannelA, abs(left));
+  ledcWrite(pwmChannelB, abs(right));
+  turnState = TURN_NONE;
+  if (left > 0 && right > 0) driveState = DRIVE_FORWARD;
+  else if (left < 0 && right < 0) driveState = DRIVE_BACKWARD;
+  else if (left == 0 && right == 0) driveState = DRIVE_STOPPED;
+  else driveState = DRIVE_TURNING;
+}
+
 // -------------------- Display --------------------
 void showWelcomePage() {
   display.clearDisplay();
@@ -538,9 +575,9 @@ void showWelcomePage() {
   display.setCursor(0, 28);
   display.println("Menu Pages:");
   for(uint8_t i=0; i<totalPages-1; i++) {
-    display.setCursor(0, 38 + i*9);
+    display.setCursor(4 + (i / 3) * 64, 38 + (i % 3) * 9);
     display.print(i+1);
-    display.print(". ");
+    display.print(".");
     display.println(pageNames[i]);
   }
   display.display();
@@ -572,6 +609,21 @@ void showPosePage() {
   display.println();
   display.println("Predicted +1s:");
   display.printf("(%.0f, %.0f)\n", predX, predY);
+  display.display();
+}
+
+void showNeuralPage() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("NEURAL DRIVE");
+  display.printf("F %4.0fmm L %u R %u\n",
+                 distanceFront * 10.0f, distLeft == 65535 ? 0 : distLeft,
+                 distRight == 65535 ? 0 : distRight);
+  display.printf("NN L %+.2f R %+.2f\n", nnOutL, nnOutR);
+  display.printf("PWM %d %d\n", (int)(nnOutL * 200), (int)(nnOutR * 200));
+  display.println(gyroYawRate > 5 ? "turning left" : gyroYawRate < -5 ? "turning right" : "straight");
   display.display();
 }
 
@@ -731,6 +783,66 @@ void ultrasonicHybridDrive() {
                 distRight, rightObstacleStreak, motorState);
 }
 
+// -------------------- Neural drive --------------------
+// The net was trained offline (ml/train_policy.py) to copy a wall follower.
+// It gets the three distances, the distance deltas, the gyro rate and its
+// previous speed, and returns one wheel command per side.
+static int netPwm(float v) {
+  int p = (int)(v * 200.0f);
+  if (p > 0 && p < 22) p = 22;
+  if (p < 0 && p > -22) p = -22;
+  return p;
+}
+
+void neuralDrive() {
+  static unsigned long lastRead = 0, lastDraw = 0;
+  if (millis() - lastRead < 40) return; // 25 Hz is plenty
+  lastRead = millis();
+
+  distLeft = sensorLeft.readRangeContinuousMillimeters();
+  distRight = sensorRight.readRangeContinuousMillimeters();
+  if (sensorLeft.timeoutOccurred()) distLeft = 65535;
+  if (sensorRight.timeoutOccurred()) distRight = 65535;
+  readUltrasonic();
+
+  float f = (distanceFront > 0) ? distanceFront * 10.0f : 1200.0f;
+  float l = (distLeft != 65535) ? (float)distLeft : 800.0f;
+  float r = (distRight != 65535) ? (float)distRight : 800.0f;
+  f = constrain(f, 0.0f, 1200.0f);
+  l = constrain(l, 0.0f, 800.0f);
+  r = constrain(r, 0.0f, 800.0f);
+
+  float in[NN_IN] = {
+    f / 1200.0f,
+    l / 800.0f,
+    r / 800.0f,
+    constrain((r - l) / 800.0f, -1.0f, 1.0f),
+    constrain((l - nnPrevL) / 150.0f, -1.0f, 1.0f),
+    constrain((r - nnPrevR) / 150.0f, -1.0f, 1.0f),
+    constrain(gyroYawRate / 120.0f, -1.0f, 1.0f),
+    max(0.0f, (nnOutL + nnOutR) * 0.5f),
+  };
+  nnPrevL = l;
+  nnPrevR = r;
+
+  float out[NN_OUT];
+  nnPolicy(in, out);
+
+  nnOutL += (out[0] - nnOutL) * 0.5f;
+  nnOutR += (out[1] - nnOutR) * 0.5f;
+
+  if (distanceFront > 0 && distanceFront < 7.0f) {
+    stopMotors(); // 70 mm, don't trust the net that close
+  } else {
+    setWheels(netPwm(nnOutL), netPwm(nnOutR));
+  }
+
+  if (millis() - lastDraw > 200) {
+    lastDraw = millis();
+    showNeuralPage();
+  }
+}
+
 // -------------------- Pose Estimation (Dead Reckoning) --------------------
 void calibrateGyroBias() {
   Serial.println("Calibrating gyro bias, keep robot still...");
@@ -763,6 +875,7 @@ void updatePose() {
   sensors_event_t a, g, t;
   mpu.getEvent(&a, &g, &t);
   float yawRateDegPerSec = (g.gyro.z * 180.0 / PI) - gyroZBiasDegPerSec;
+  gyroYawRate = yawRateDegPerSec;
   pose.heading += yawRateDegPerSec * dt;
   if (pose.heading > 180) pose.heading -= 360;
   if (pose.heading < -180) pose.heading += 360;
