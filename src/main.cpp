@@ -11,6 +11,8 @@
 #include "nn_policy.h"
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
 #include <driver/i2s.h>
 
 // Local creds live in include/wifi_config.h (untracked). Empty = AP only.
@@ -21,6 +23,11 @@
 #define WIFI_PASS ""
 #define AP_SSID "MazeRunner"
 #define AP_PASS "mazerunner123"
+#endif
+
+// IP of the laptop running server.py. Can be changed from the web page.
+#ifndef LAPTOP_HOST
+#define LAPTOP_HOST ""
 #endif
 
 // Pin definitions
@@ -82,11 +89,12 @@ unsigned long noteStart = 0;
 int noteLength = 0;
 
 // Page 0 = Welcome, 1 = Greeting, 2 = Eyes, 3 = Autonomous Drive,
-// 4 = Pose Telemetry, 5 = Neural Drive, 6 = Voice
-const uint8_t totalPages = 7;
-const char* pageNames[totalPages - 1] = {"Greet", "Eyes", "Drive", "Pose", "Neural", "Voice"};
+// 4 = Pose Telemetry, 5 = Neural Drive, 6 = Laptop, 7 = Voice
+const uint8_t totalPages = 8;
+const char* pageNames[totalPages - 1] = {"Greet", "Eyes", "Drive", "Pose", "Neural", "Laptop", "Voice"};
 const uint8_t NEURAL_PAGE = 5;
-const uint8_t VOICE_PAGE = 6;
+const uint8_t LAPTOP_PAGE = 6;
+const uint8_t VOICE_PAGE = 7;
 uint8_t currentPage = 0;
 
 VL53L0X sensorLeft;
@@ -104,10 +112,16 @@ WebServer webServer(80);
 int webSpeed = 150; // 0..255, set from the site slider
 String lastVoiceText = ""; // last YOU/AI text from the PC script, shown on site + voice page
 String botIP = "no wifi";
+String laptopHost = LAPTOP_HOST; // server.py machine, settable from the web page
+String lastAIAnswer = "";
+String lastLaptopAction = "idle";
+String lastLaptopThought = "";
+Preferences prefs;
 
 // -------------------- Voice page state --------------------
 static bool micOk = false; // I2S mic installed? (lazy: only while on voice page)
-static int16_t *voiceBuf = nullptr;
+static uint8_t *voiceBufAlloc = nullptr; // 44 byte wav header + pcm
+static int16_t *voiceBuf = nullptr;      // points past the header
 static size_t voiceCap = 0; // samples
 static size_t voiceLen = 0;
 static bool voiceRec = false;
@@ -185,6 +199,13 @@ void showPosePage();
 void showNeuralPage();
 void neuralDrive();
 void setWheels(int left, int right);
+void showLaptopPage();
+void laptopDrive();
+void loadLaptopSettings();
+String httpPostJson(const String& url, const String& body, int* code);
+String httpPostWav(const String& url, const uint8_t* data, size_t len, int* code);
+String jsonField(const String& js, const char* key);
+String escJson(const String& s);
 void ultrasonicHybridDrive();
 void sensorPowerDown(int pin);
 void sensorPowerUp(int pin);
@@ -201,6 +222,8 @@ void handleWebRoot();
 void handleWebCmd();
 void handleWebSpeed();
 void handleWebSensors();
+void handleWebAsk();
+void handleWebTarget();
 void webBurst(const String& dir);
 bool initMic();
 void ensureMic();
@@ -210,6 +233,7 @@ void voiceStart();
 void voiceCapture();
 void voiceCancel();
 void voiceFinishSend();
+void voiceSendWifi();
 void pollSerialReply();
 void showWrapped(const String& title, const String& body);
 
@@ -274,6 +298,7 @@ void setup() {
   // while installed, so the mic is started lazily on Voice-page entry
   // (ensureMic) and stopped on exit (deinitMic). BTN1 works everywhere else.
   setupWifi(); // STA first, own AP if that fails
+  loadLaptopSettings();
   setupWeb();
 
   beep(2);
@@ -323,6 +348,8 @@ void loop() {
     showPosePage();
   } else if(currentPage == NEURAL_PAGE) {
     neuralDrive();
+  } else if(currentPage == LAPTOP_PAGE) {
+    laptopDrive();
   } else if(currentPage == VOICE_PAGE) {
     // BTN2 hold-to-talk: record while held, send on release.
     // A quick tap (<400ms) exits to the next page instead — BTN1/GPIO0
@@ -374,7 +401,11 @@ void advancePage() {
       nnPrevL = nnPrevR = 800;
       showNeuralPage();
       break;
-    case 6: voiceStatus = V_IDLE; ensureMic(); showVoicePage(); break;
+    case 6:
+      stopMotors();
+      showLaptopPage();
+      break;
+    case 7: voiceStatus = V_IDLE; ensureMic(); showVoicePage(); break;
   }
   delay(250);
 }
@@ -572,13 +603,13 @@ void showWelcomePage() {
   display.println(robotName);
 
   display.setTextSize(1);
-  display.setCursor(0, 28);
-  display.println("Menu Pages:");
+  display.setCursor(0, 24);
+  display.println("Menu:");
   for(uint8_t i=0; i<totalPages-1; i++) {
-    display.setCursor(4 + (i / 3) * 64, 38 + (i % 3) * 9);
+    display.setCursor(2 + (i / 4) * 64, 32 + (i % 4) * 8);
     display.print(i+1);
     display.print(".");
-    display.println(pageNames[i]);
+    display.print(pageNames[i]);
   }
   display.display();
 }
@@ -926,6 +957,162 @@ void setupWifi() {
   }
 }
 
+// -------------------- Laptop link --------------------
+// The heavy stuff (vosk + ollama) runs on the PC. The robot only posts
+// sensor state or a wav file and waits for a short json answer.
+void loadLaptopSettings() {
+  prefs.begin("maze", true);
+  String saved = prefs.getString("laptop", "");
+  prefs.end();
+  if (saved.length()) laptopHost = saved;
+  Serial.printf("laptop host: %s\n", laptopHost.length() ? laptopHost.c_str() : "(not set)");
+}
+
+String escJson(const String& s) {
+  String o;
+  o.reserve(s.length() + 8);
+  for (unsigned i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"') o += "'";
+    else if (c == '\\') o += '/';
+    else if (c == '\n' || c == '\r' || c == '\t') o += ' ';
+    else o += c;
+  }
+  return o;
+}
+
+String jsonField(const String& js, const char* key) {
+  String pat = String("\"") + key + "\"";
+  int k = js.indexOf(pat);
+  if (k < 0) return "";
+  k = js.indexOf(':', k + pat.length());
+  if (k < 0) return "";
+  k = js.indexOf('"', k);
+  if (k < 0) return "";
+  int e = k + 1;
+  while (e < (int)js.length()) {
+    if (js[e] == '\\') { e += 2; continue; }
+    if (js[e] == '"') break;
+    e++;
+  }
+  return js.substring(k + 1, e);
+}
+
+String httpPostJson(const String& url, const String& body, int* code) {
+  HTTPClient http;
+  http.setConnectTimeout(4000);
+  http.setTimeout(20000);
+  if (!http.begin(url)) {
+    if (code) *code = -1;
+    return "";
+  }
+  http.addHeader("Content-Type", "application/json");
+  int c = http.POST((uint8_t*)body.c_str(), body.length());
+  String resp = (c > 0) ? http.getString() : "";
+  http.end();
+  if (code) *code = c;
+  Serial.printf("POST %s -> %d\n", url.c_str(), c);
+  return resp;
+}
+
+String httpPostWav(const String& url, const uint8_t* data, size_t len, int* code) {
+  HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(30000);
+  if (!http.begin(url)) {
+    if (code) *code = -1;
+    return "";
+  }
+  http.addHeader("Content-Type", "audio/wav");
+  int c = http.POST((uint8_t*)data, len);
+  String resp = (c > 0) ? http.getString() : "";
+  http.end();
+  if (code) *code = c;
+  Serial.printf("POST wav %u bytes -> %d\n", (unsigned)len, c);
+  return resp;
+}
+
+void showLaptopPage() {
+  String msg = "IP: ";
+  msg += laptopHost.length() ? laptopHost : "set it on the web page";
+  msg += "\n";
+  msg += lastLaptopAction;
+  if (lastLaptopThought.length()) {
+    msg += "\n";
+    msg += lastLaptopThought;
+  }
+  showWrapped("LAPTOP BRAIN", msg);
+}
+
+// Asks the laptop for one action every 2s. Ollama is slow, so the robot
+// moves in short bursts and stops in between. Local front distance still
+// overrides a forward command, no matter what the model says.
+void laptopDrive() {
+  static unsigned long last = 0;
+  if (millis() - last < 2000) return;
+  last = millis();
+
+  distLeft = sensorLeft.readRangeContinuousMillimeters();
+  distRight = sensorRight.readRangeContinuousMillimeters();
+  if (sensorLeft.timeoutOccurred()) distLeft = 65535;
+  if (sensorRight.timeoutOccurred()) distRight = 65535;
+  readUltrasonic();
+
+  if (!laptopHost.length()) {
+    stopMotors();
+    lastLaptopAction = "no laptop ip";
+    lastLaptopThought = "open the web page and set it";
+    showLaptopPage();
+    return;
+  }
+
+  String body = "{\"front\":";
+  body += String(distanceFront > 0 ? distanceFront * 10.0f : 999);
+  body += ",\"left\":";
+  body += String(distLeft == 65535 ? 999 : distLeft);
+  body += ",\"right\":";
+  body += String(distRight == 65535 ? 999 : distRight);
+  body += ",\"heading\":";
+  body += String(pose.heading, 1);
+  body += "}";
+
+  int code = 0;
+  String resp = httpPostJson("http://" + laptopHost + ":5000/drive", body, &code);
+  if (code <= 0) {
+    stopMotors();
+    lastLaptopAction = "laptop offline";
+    lastLaptopThought = "run server.py on the pc";
+    showLaptopPage();
+    return;
+  }
+
+  String action = jsonField(resp, "action");
+  int speed = jsonField(resp, "speed").toInt();
+  if (speed < 60 || speed > 220) speed = 140;
+  String thought = jsonField(resp, "thought");
+  if (thought.length() > 60) thought = thought.substring(0, 60);
+
+  bool frontClose = (distanceFront > 0 && distanceFront < 15);
+  if (action == "forward" && !frontClose) {
+    moveForward(speed, speed);
+    delay(500);
+  } else if (action == "backward") {
+    moveBackward(speed, speed);
+    delay(500);
+  } else if (action == "left") {
+    turnLeftStart(speed, speed);
+    delay(260);
+  } else if (action == "right") {
+    turnRightStart(speed, speed);
+    delay(260);
+  }
+  stopMotors();
+
+  lastLaptopAction = action.length() ? action : "no action";
+  lastLaptopThought = thought;
+  showLaptopPage();
+}
+
 // -------------------- Control website --------------------
 String escHtml(const String& s) {
   String o = s;
@@ -944,6 +1131,10 @@ void handleWebRoot() {
   h += "<tr><td></td><td><a class='btn' href='/cmd?dir=B'>B</a></td><td></td></tr></table>";
   h += "<form action='/speed'>Speed <input type='range' name='v' min='0' max='255' value='" + String(webSpeed) + "'>";
   h += "<input type='submit' value='Set'></form>";
+  h += "<p>Laptop: <b>" + escHtml(laptopHost.length() ? laptopHost : "not set") + "</b></p>";
+  h += "<form action='/ask'>Ask laptop: <input name='q' size='18'> <input type='submit' value='Ask'></form>";
+  h += "<p>Laptop says: <b>" + escHtml(lastAIAnswer) + "</b></p>";
+  h += "<form action='/target'>Laptop IP <input name='host' value='" + laptopHost + "'> <input type='submit' value='Save'></form>";
   h += "<p>Sensors: <span id='s'>...</span></p>";
   h += "<p>Last voice: <b>" + escHtml(lastVoiceText) + "</b></p>";
   h += "<script>setInterval(async()=>{try{const r=await fetch('/sensors');const j=await r.json();document.getElementById('s').textContent=j.front+'cm / '+j.left+'mm / '+j.right+'mm';}catch(e){}},1000);</script>";
@@ -971,6 +1162,36 @@ void handleWebSpeed() {
   webServer.send(303);
 }
 
+void handleWebAsk() {
+  String q = webServer.arg("q");
+  q.trim();
+  lastAIAnswer = "";
+  if (q.length() && laptopHost.length()) {
+    int code = 0;
+    String resp = httpPostJson("http://" + laptopHost + ":5000/ask",
+                               "{\"question\":\"" + escJson(q) + "\"}", &code);
+    lastAIAnswer = (code > 0) ? jsonField(resp, "response") : "laptop offline";
+  } else if (!laptopHost.length()) {
+    lastAIAnswer = "set the laptop ip first";
+  }
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+void handleWebTarget() {
+  String host = webServer.arg("host");
+  host.trim();
+  if (host.length()) {
+    laptopHost = host;
+    prefs.begin("maze", false);
+    prefs.putString("laptop", laptopHost);
+    prefs.end();
+    Serial.printf("laptop host set to %s\n", laptopHost.c_str());
+  }
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
 void handleWebSensors() {
   uint16_t l = sensorLeft.readRangeContinuousMillimeters();
   uint16_t r = sensorRight.readRangeContinuousMillimeters();
@@ -987,6 +1208,8 @@ void setupWeb() {
   webServer.on("/cmd", handleWebCmd);
   webServer.on("/speed", handleWebSpeed);
   webServer.on("/sensors", handleWebSensors);
+  webServer.on("/ask", handleWebAsk);
+  webServer.on("/target", handleWebTarget);
   webServer.begin();
   Serial.println("web site up on port 80");
 }
@@ -1077,11 +1300,15 @@ void showVoicePage() {
   }
   if (voiceStatus == V_RECORDING) return; // progress drawn by voiceCapture
   if (voiceStatus == V_WAITING) {
-    showWrapped("VOICE", "thinking... (PC transcribes + asks ollama)");
+    showWrapped("VOICE", laptopHost.length()
+                             ? "thinking... (laptop transcribes + asks ollama)"
+                             : "thinking... (PC transcribes + asks ollama)");
     return;
   }
   if (voiceStatus == V_NOLINK) {
-    showWrapped("VOICE", "no reply. start mazerunner_voice.py on the PC, then hold BTN2 again.");
+    showWrapped("VOICE", laptopHost.length()
+                             ? "no answer from laptop. is server.py running?"
+                             : "no reply. start mazerunner_voice.py on the PC.");
     return;
   }
   if (voiceStatus == V_RESULT) {
@@ -1091,21 +1318,26 @@ void showVoicePage() {
     return;
   }
   // idle
-  String msg = "Hold BTN2, speak, release.\nIP: " + botIP;
+  String msg = "Hold BTN2, speak, release.\n";
+  msg += laptopHost.length() ? ("Laptop: " + laptopHost) : String("USB: mazerunner_voice.py");
+  msg += "\nIP: " + botIP;
   if (lastVoiceText.length()) msg += String("\nLast: ") + lastVoiceText;
   showWrapped("VOICE", msg);
 }
 
 void voiceStart() {
   if (!micOk) return;
-  size_t maxSamples = voiceMaxSec() * I2S_SAMPLE_RATE;
-  if (voiceBuf) { free(voiceBuf); voiceBuf = nullptr; }
-  voiceBuf = (int16_t *)malloc(maxSamples * sizeof(int16_t));
-  if (!voiceBuf) {
+  // keep wifi uploads short, 5s is plenty for one sentence
+  size_t secs = laptopHost.length() ? 5 : voiceMaxSec();
+  size_t maxSamples = secs * I2S_SAMPLE_RATE;
+  if (voiceBufAlloc) { free(voiceBufAlloc); voiceBufAlloc = nullptr; voiceBuf = nullptr; }
+  voiceBufAlloc = (uint8_t *)malloc(44 + maxSamples * sizeof(int16_t));
+  if (!voiceBufAlloc) {
     voiceStatus = V_IDLE;
     showWrapped("VOICE", "out of memory for recording");
     return;
   }
+  voiceBuf = (int16_t *)(voiceBufAlloc + 44);
   voiceCap = maxSamples;
   voiceLen = 0;
   voiceRec = true;
@@ -1149,7 +1381,7 @@ void voiceCapture() {
 
 void voiceCancel() {
   voiceRec = false;
-  if (voiceBuf) { free(voiceBuf); voiceBuf = nullptr; }
+  if (voiceBufAlloc) { free(voiceBufAlloc); voiceBufAlloc = nullptr; voiceBuf = nullptr; }
   voiceCap = voiceLen = 0;
   voiceStatus = V_IDLE;
 }
@@ -1157,6 +1389,11 @@ void voiceCancel() {
 void voiceFinishSend() {
   voiceRec = false;
   uint32_t n = (uint32_t)(voiceLen * sizeof(int16_t));
+  lastVoiceText = "";
+  if (laptopHost.length()) {
+    voiceSendWifi();
+    return;
+  }
   Serial.print("AUDHDR");
   Serial.write((const uint8_t *)&n, 4);
   Serial.flush();
@@ -1172,6 +1409,54 @@ void voiceFinishSend() {
   Serial.printf("AUDEND %u\n", (unsigned)n);
   voiceStatus = V_WAITING;
   voiceWaitStart = millis();
+  showVoicePage();
+}
+
+// -------------------- Voice over wifi --------------------
+static void put16(uint8_t *p, uint16_t v) { p[0] = v & 0xff; p[1] = v >> 8; }
+static void put32(uint8_t *p, uint32_t v) {
+  p[0] = v & 0xff; p[1] = (v >> 8) & 0xff; p[2] = (v >> 16) & 0xff; p[3] = v >> 24;
+}
+
+static void wavHeader(uint8_t *h, uint32_t dataLen) {
+  memcpy(h, "RIFF", 4);
+  put32(h + 4, 36 + dataLen);
+  memcpy(h + 8, "WAVEfmt ", 8);
+  put32(h + 16, 16);
+  put16(h + 20, 1);                  // pcm
+  put16(h + 22, 1);                  // mono
+  put32(h + 24, I2S_SAMPLE_RATE);
+  put32(h + 28, I2S_SAMPLE_RATE * 2);
+  put16(h + 32, 2);                  // block align
+  put16(h + 34, 16);                 // bits
+  memcpy(h + 36, "data", 4);
+  put32(h + 40, dataLen);
+}
+
+void voiceSendWifi() {
+  uint32_t dataLen = (uint32_t)(voiceLen * sizeof(int16_t));
+  wavHeader(voiceBufAlloc, dataLen);
+  voiceStatus = V_WAITING;
+  voiceWaitStart = millis();
+  showVoicePage();
+
+  int code = 0;
+  String resp = httpPostWav("http://" + laptopHost + ":5000/stt",
+                            voiceBufAlloc, 44 + dataLen, &code);
+  if (voiceBufAlloc) { free(voiceBufAlloc); voiceBufAlloc = nullptr; voiceBuf = nullptr; }
+  voiceCap = voiceLen = 0;
+
+  if (code <= 0) {
+    voiceStatus = V_NOLINK;
+    Serial.printf("voice wifi failed, code %d\n", code);
+    showVoicePage();
+    return;
+  }
+  voiceHeard = jsonField(resp, "text");
+  voiceReply = jsonField(resp, "reply");
+  if (!voiceHeard.length()) voiceHeard = "(nothing heard)";
+  lastVoiceText = voiceHeard + (voiceReply.length() ? " -> " + voiceReply : "");
+  voiceStatus = V_RESULT;
   showVoicePage();
 }
 
