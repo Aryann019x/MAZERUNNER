@@ -103,6 +103,7 @@ String lastVoiceText = ""; // last YOU/AI text from the PC script, shown on site
 String botIP = "no wifi";
 
 // -------------------- Voice page state --------------------
+static bool micOk = false; // I2S mic installed? (lazy: only while on voice page)
 static int16_t *voiceBuf = nullptr;
 static size_t voiceCap = 0; // samples
 static size_t voiceLen = 0;
@@ -191,6 +192,9 @@ void handleWebSpeed();
 void handleWebSensors();
 void webBurst(const String& dir);
 bool initMic();
+void ensureMic();
+void deinitMic();
+void advancePage();
 void voiceStart();
 void voiceCapture();
 void voiceCancel();
@@ -255,7 +259,9 @@ void setup() {
   calibrateGyroBias();
   lastPoseMicros = micros();
 
-  initMic(); // ok to fail, voice page just reports it
+  // NOTE: mic is NOT started here. i2s_driver_install wedges BTN1/GPIO0
+  // while installed, so the mic is started lazily on Voice-page entry
+  // (ensureMic) and stopped on exit (deinitMic). BTN1 works everywhere else.
   setupWifi(); // STA first, own AP if that fails
   setupWeb();
 
@@ -266,38 +272,28 @@ void setup() {
 
 void loop() {
   static uint8_t prevBtn1 = HIGH, prevBtn2 = HIGH;
+  static bool btn1Armed = false; // ignore BTN1 until seen HIGH once (kills reset-pulse phantom press)
+  static unsigned long btn2DownAt = 0; // BTN2 press time: tap vs hold on voice page
   uint8_t btn1 = digitalRead(BTN1_PIN);
   uint8_t btn2 = digitalRead(BTN2_PIN);
+
+  if (btn1 == HIGH) btn1Armed = true;
 
   // Pose integration runs every cycle regardless of page, so heading
   // doesn't get stale gaps when you're on the Eyes or Greeting page.
   updatePose();
 
-  if(btn1 == LOW && prevBtn1 == HIGH) {
-    beep(1);
-    if (voiceRec) voiceCancel(); // leaving the page mid-record drops it
-    currentPage = (currentPage + 1) % totalPages;
-    display.clearDisplay();
+  // Either button advances pages (BTN1/GPIO0 can wedge LOW when USB-serial
+  // holds the auto-reset line or while the I2S mic runs, so BTN2 is a backup).
+  // On the Voice page BTN2 is hold-to-talk / tap-to-exit (see below).
+  bool advPress = false;
+  if (btn1Armed && btn1 == LOW && prevBtn1 == HIGH) advPress = true;
+  if (currentPage != VOICE_PAGE && btn2 == LOW && prevBtn2 == HIGH) advPress = true;
 
-    switch(currentPage) {
-      case 0: showWelcomePage(); break;
-      case 1: showGreetingPage(); break;
-      case 2:
-        center_eyes();
-        draw_eyes();
-        display.display();
-        break;
-      case 3: break; // Autonomous Drive renders itself continuously below
-      case 4: showPosePage(); break;
-      case 5: voiceStatus = V_IDLE; showVoicePage(); break;
-    }
-    delay(250);
+  if(advPress) {
+    advancePage();
   }
 
-  if(btn2 == LOW && prevBtn2 == HIGH) {
-    beep(1);
-    delay(200);
-  }
   prevBtn1 = btn1;
   prevBtn2 = btn2;
 
@@ -316,12 +312,20 @@ void loop() {
     showPosePage();
   } else if(currentPage == VOICE_PAGE) {
     // BTN2 hold-to-talk: record while held, send on release.
-    if (btn2 == LOW && !voiceRec && voiceStatus != V_WAITING) {
+    // A quick tap (<400ms) exits to the next page instead — BTN1/GPIO0
+    // reads dead while the I2S mic driver is installed, so BTN2 is the exit.
+    if (btn2 == LOW && prevBtn2 == HIGH) btn2DownAt = millis();
+    if (micOk && btn2 == LOW && !voiceRec && voiceStatus != V_WAITING) {
       voiceStart();
     }
     if (voiceRec) {
       voiceCapture();
-      if (btn2 == HIGH) voiceFinishSend(); // released
+      if (btn2 == HIGH) {
+        if (millis() - btn2DownAt < 400) { voiceCancel(); advancePage(); } // tap → exit
+        else voiceFinishSend(); // hold → send
+      }
+    } else if (btn2 == HIGH && prevBtn2 == LOW) {
+      if (millis() - btn2DownAt < 400) advancePage(); // tap → exit
     }
     if (voiceStatus == V_WAITING && millis() - voiceWaitStart > 30000) {
       voiceStatus = V_NOLINK; // PC script not running
@@ -332,6 +336,29 @@ void loop() {
   }
   webServer.handleClient(); // control site, cheap to poll
   pollSerialReply(); // TXTHDR answers from the PC script, any page
+}
+
+// -------------------- Page navigation --------------------
+void advancePage() {
+  beep(1);
+  if (voiceRec) voiceCancel(); // leaving the page mid-record drops it
+  if (currentPage == VOICE_PAGE) deinitMic(); // free I2S: restores BTN1/GPIO0
+  currentPage = (currentPage + 1) % totalPages;
+  display.clearDisplay();
+
+  switch(currentPage) {
+    case 0: showWelcomePage(); break;
+    case 1: showGreetingPage(); break;
+    case 2:
+      center_eyes();
+      draw_eyes();
+      display.display();
+      break;
+    case 3: break; // Autonomous Drive renders itself continuously below
+    case 4: showPosePage(); break;
+    case 5: voiceStatus = V_IDLE; ensureMic(); showVoicePage(); break;
+  }
+  delay(250);
 }
 
 // -------------------- Eyes functions --------------------
@@ -725,6 +752,10 @@ void calibrateGyroBias() {
 void updatePose() {
   unsigned long nowMicros = micros();
   if (lastPoseMicros == 0) { lastPoseMicros = nowMicros; return; }
+  // Throttle MPU reads to 50Hz: every-loop reads hammer a flaky I2C bus
+  // (error flood) and 50Hz is plenty for gyro integration. dt is measured
+  // between actual reads so no rotation is lost.
+  if (nowMicros - lastPoseMicros < 20000) return;
   float dt = (nowMicros - lastPoseMicros) / 1000000.0f; // seconds
   lastPoseMicros = nowMicros;
   if (dt <= 0 || dt > 1.0f) return; // guard against overflow/first-run glitches
@@ -848,7 +879,7 @@ void setupWeb() {
 }
 
 // -------------------- Mic (INMP441 over I2S) --------------------
-static bool micOk = false;
+// (micOk lives with the voice state at the top of the file.)
 
 bool initMic() {
   i2s_config_t cfg = {
@@ -876,6 +907,24 @@ bool initMic() {
   micOk = true;
   Serial.println("mic ready: SCK=10 WS=11 SD=12 @16kHz");
   return true;
+}
+
+// Starts the mic on Voice-page entry. The I2S driver wedges BTN1/GPIO0
+// while installed, so it only runs while the voice page is showing.
+void ensureMic() {
+  if (micOk) return;
+  if (initMic()) Serial.println("mic on (voice page)");
+  else Serial.println("mic lazy init failed");
+}
+
+// Stops the mic when leaving the Voice page — frees I2S, restores BTN1.
+void deinitMic() {
+  if (voiceRec) voiceCancel();
+  if (micOk) {
+    i2s_driver_uninstall(I2S_PORT);
+    Serial.println("mic off, BTN1 back");
+  }
+  micOk = false;
 }
 
 // -------------------- Voice page --------------------
