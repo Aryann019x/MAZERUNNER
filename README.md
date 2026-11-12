@@ -72,6 +72,12 @@ python ml/train_policy.py
 
 That regenerates `include/nn_policy.h` with int8 weights. Inference in `src/nn_policy.cpp` uses floats. A hard stop kicks in below 70 mm on the front sensor, no matter what the network says.
 
+### Motor trim
+
+The two gear motors never run at exactly the same speed, so a straight command slowly drifts. While the robot is driving straight, the firmware averages the gyro yaw rate over a second and nudges a scale factor on the right wheel until the heading stops drifting. The value is saved in NVS and shown on the Pose page.
+
+The web page can reset it, set it by hand, or run a calibration: five short straight bursts in open space (about 1.2 m ahead is enough), re-checking the gyro bias first. Normal driving keeps fine-tuning it afterwards.
+
 ### Laptop bridge
 
 `server.py` runs on a laptop on the same Wi-Fi and wraps ollama (`qwen2.5:3b` by default) and vosk:

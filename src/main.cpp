@@ -154,6 +154,15 @@ float gyroZBiasDegPerSec = 0;
 float gyroYawRate = 0; // deg/s, filtered gyro z, used by the neural page
 unsigned long lastPoseMicros = 0;
 
+// Right-wheel scale learned from the gyro. 1.0 = no correction. The motors
+// are never perfectly matched, so straight commands slowly drift; this trims
+// the faster side until the yaw rate sits near zero. Saved in NVS.
+float motorBalance = 1.0f;
+bool balanceDirty = false;
+unsigned long lastBalanceSave = 0;
+bool straightCmd = false;
+float trimYawSum = 0, trimRunTime = 0;
+
 // TUNE THESE: run moveForward(forwardSpeed,forwardSpeed) for exactly 2s on a
 // known-length straight run, measure distance traveled in mm, divide by 2.
 // Repeat for backward. These placeholders are almost certainly wrong for your robot.
@@ -215,6 +224,11 @@ void updateOLEDVL53(float front, uint16_t left, uint16_t right, const char* moto
 void calibrateGyroBias();
 void updatePose();
 void predictPosition(float secondsAhead, float &predX, float &predY);
+void loadMotorBalance();
+void saveMotorBalance();
+int balancedRight(int pwm);
+void calibrateMotorBalance();
+void handleWebTrim();
 void showVoicePage();
 void setupWifi();
 void setupWeb();
@@ -299,6 +313,7 @@ void setup() {
   // (ensureMic) and stopped on exit (deinitMic). BTN1 works everywhere else.
   setupWifi(); // STA first, own AP if that fails
   loadLaptopSettings();
+  loadMotorBalance();
   setupWeb();
 
   beep(2);
@@ -498,6 +513,12 @@ void updateEyesWithMPU() {
 }
 
 // -------------------- Motors --------------------
+// Motor A is the left wheel, motor B is the right one. Only the right side
+// gets the learned scale; it is the easiest place to hide the mismatch.
+int balancedRight(int pwm) {
+  return constrain((int)lroundf(pwm * motorBalance), 0, 255);
+}
+
 void moveForward(uint8_t left, uint8_t right) {
   digitalWrite(STBY, HIGH);
   digitalWrite(AIN1, HIGH);
@@ -505,7 +526,8 @@ void moveForward(uint8_t left, uint8_t right) {
   digitalWrite(BIN1, HIGH);
   digitalWrite(BIN2, LOW);
   ledcWrite(pwmChannelA, left);
-  ledcWrite(pwmChannelB, right);
+  ledcWrite(pwmChannelB, balancedRight(right));
+  straightCmd = (left == right && left > 0);
   driveState = DRIVE_FORWARD;
 }
 
@@ -516,7 +538,8 @@ void moveBackward(uint8_t left, uint8_t right) {
   digitalWrite(BIN1, LOW);
   digitalWrite(BIN2, HIGH);
   ledcWrite(pwmChannelA, left);
-  ledcWrite(pwmChannelB, right);
+  ledcWrite(pwmChannelB, balancedRight(right));
+  straightCmd = (left == right && left > 0);
   driveState = DRIVE_BACKWARD;
 }
 
@@ -529,6 +552,7 @@ void turnRightStart(uint8_t left, uint8_t right) {
   digitalWrite(BIN2, LOW);
   ledcWrite(pwmChannelA, left);
   ledcWrite(pwmChannelB, right);
+  straightCmd = false;
   turnState = TURNING_RIGHT;
   turnStartTime = millis();
   driveState = DRIVE_TURNING;
@@ -542,6 +566,7 @@ void turnLeftStart(uint8_t left, uint8_t right) {
   digitalWrite(BIN2, HIGH);
   ledcWrite(pwmChannelA, left);
   ledcWrite(pwmChannelB, right);
+  straightCmd = false;
   turnState = TURNING_LEFT;
   turnStartTime = millis();
   driveState = DRIVE_TURNING;
@@ -568,6 +593,7 @@ void stopMotors() {
   digitalWrite(BIN1, LOW);
   digitalWrite(BIN2, LOW);
   digitalWrite(STBY, HIGH);
+  straightCmd = false;
   driveState = DRIVE_STOPPED;
   turnState = TURN_NONE;
 }
@@ -577,17 +603,19 @@ void stopMotors() {
 void setWheels(int left, int right) {
   left = constrain(left, -255, 255);
   right = constrain(right, -255, 255);
+  int r = (right >= 0) ? balancedRight(right) : -balancedRight(-right);
   digitalWrite(STBY, HIGH);
   digitalWrite(AIN1, left >= 0 ? HIGH : LOW);
   digitalWrite(AIN2, left >= 0 ? LOW : HIGH);
-  digitalWrite(BIN1, right >= 0 ? HIGH : LOW);
-  digitalWrite(BIN2, right >= 0 ? LOW : HIGH);
+  digitalWrite(BIN1, r >= 0 ? HIGH : LOW);
+  digitalWrite(BIN2, r >= 0 ? LOW : HIGH);
   ledcWrite(pwmChannelA, abs(left));
-  ledcWrite(pwmChannelB, abs(right));
+  ledcWrite(pwmChannelB, abs(r));
+  straightCmd = (left == right && left != 0);
   turnState = TURN_NONE;
-  if (left > 0 && right > 0) driveState = DRIVE_FORWARD;
-  else if (left < 0 && right < 0) driveState = DRIVE_BACKWARD;
-  else if (left == 0 && right == 0) driveState = DRIVE_STOPPED;
+  if (left > 0 && r > 0) driveState = DRIVE_FORWARD;
+  else if (left < 0 && r < 0) driveState = DRIVE_BACKWARD;
+  else if (left == 0 && r == 0) driveState = DRIVE_STOPPED;
   else driveState = DRIVE_TURNING;
 }
 
@@ -637,7 +665,7 @@ void showPosePage() {
   display.printf("X:   %.0f mm\n", pose.x);
   display.printf("Y:   %.0f mm\n", pose.y);
   display.printf("Hdg: %.1f deg\n", pose.heading);
-  display.println();
+  display.printf("Trim R: %+.1f%%\n", (motorBalance - 1.0f) * 100.0f);
   display.println("Predicted +1s:");
   display.printf("(%.0f, %.0f)\n", predX, predY);
   display.display();
@@ -745,7 +773,8 @@ void updateOLEDVL53(float front, uint16_t left, uint16_t right, const char* moto
   display.printf("Front: %s\n", (front > 0) ? String(front, 1).c_str() : "Out");
   display.printf("Left : %s\n", (left != 65535) ? String(left).c_str() : "Out");
   display.printf("Right: %s\n", (right != 65535) ? String(right).c_str() : "Out");
-  display.printf("Motor: %s", motorState);
+  display.printf("Motor: %s\n", motorState);
+  display.printf("Trim R: %+.1f%%", (motorBalance - 1.0f) * 100.0f);
   display.display();
 }
 
@@ -889,6 +918,82 @@ void calibrateGyroBias() {
   Serial.printf("Gyro Z bias: %.3f deg/s\n", gyroZBiasDegPerSec);
 }
 
+// 1.0 = right wheel untouched. The value is a multiplier, not an offset,
+// so a motor that is 5% slow stays corrected at every speed.
+void loadMotorBalance() {
+  prefs.begin("maze", false);
+  motorBalance = prefs.getFloat("balance", 1.0f);
+  prefs.end();
+  motorBalance = constrain(motorBalance, 0.75f, 1.25f);
+  Serial.printf("motor balance: %.3f\n", motorBalance);
+}
+
+void saveMotorBalance() {
+  prefs.begin("maze", false);
+  prefs.putFloat("balance", motorBalance);
+  prefs.end();
+  balanceDirty = false;
+  lastBalanceSave = millis();
+  Serial.printf("motor balance saved: %.3f\n", motorBalance);
+}
+
+// Five short straight bursts in open space. Each one measures the average yaw
+// rate and nudges the right side until the robot stops turning on its own.
+void calibrateMotorBalance() {
+  stopMotors();
+  readUltrasonic();
+  if (distanceFront > 0 && distanceFront < 120) {
+    if (voiceRec) voiceCancel();
+    if (currentPage == VOICE_PAGE) deinitMic();
+    currentPage = 4;
+    showWrapped("TRIM", "need 1.2m clear ahead");
+    return;
+  }
+
+  if (voiceRec) voiceCancel();
+  if (currentPage == VOICE_PAGE) deinitMic();
+  showWrapped("TRIM", "keep still...");
+  calibrateGyroBias();
+  beep(1);
+
+  for (int run = 0; run < 5; run++) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.printf("TRIM RUN %d/5\n", run + 1);
+    display.printf("R %+.1f%%\n", (motorBalance - 1.0f) * 100.0f);
+    display.display();
+
+    moveForward(130, 130);
+    unsigned long start = millis();
+    float yawSum = 0;
+    int yawN = 0;
+    while (millis() - start < 700) {
+      sensors_event_t a, g, t;
+      mpu.getEvent(&a, &g, &t);
+      if (millis() - start > 150) {
+        yawSum += (g.gyro.z * 180.0 / PI) - gyroZBiasDegPerSec;
+        yawN++;
+      }
+      delay(20);
+    }
+    stopMotors();
+    delay(300);
+
+    float avgYaw = yawN ? (yawSum / yawN) : 0;
+    float step = constrain(avgYaw * 0.0015f, -0.03f, 0.03f);
+    motorBalance = constrain(motorBalance - step, 0.75f, 1.25f);
+    Serial.printf("trim run %d: yaw %.1f -> %.3f\n", run + 1, avgYaw, motorBalance);
+  }
+
+  saveMotorBalance();
+  currentPage = 4; // park on pose so nothing starts driving again
+  showPosePage();
+  beep(2);
+  Serial.printf("trim done: R %+.1f%%\n", (motorBalance - 1.0f) * 100.0f);
+}
+
 // Integrates gyro yaw rate into heading, and (very roughly) advances x/y
 // based on which drive state is active and the calibrated speed constants.
 // Call every loop() iteration, unconditionally.
@@ -910,6 +1015,32 @@ void updatePose() {
   pose.heading += yawRateDegPerSec * dt;
   if (pose.heading > 180) pose.heading -= 360;
   if (pose.heading < -180) pose.heading += 360;
+
+  // Straight command + non-zero yaw = the wheels are not matched. Integrate
+  // the error over a second and trim the right side a little. Slow on
+  // purpose: a bump or a single bad gyro sample shouldn't move the value.
+  if (straightCmd && driveState == DRIVE_FORWARD) {
+    trimYawSum += yawRateDegPerSec * dt;
+    trimRunTime += dt;
+    if (trimRunTime >= 1.0f) {
+      float avgYaw = trimYawSum / trimRunTime;
+      if (fabs(avgYaw) > 1.5f) {
+        float step = constrain(avgYaw * 0.0015f, -0.025f, 0.025f);
+        float nextBalance = constrain(motorBalance - step, 0.75f, 1.25f);
+        if (fabs(nextBalance - motorBalance) > 0.0005f) {
+          motorBalance = nextBalance;
+          balanceDirty = true;
+          Serial.printf("trim: yaw %.1f deg/s, balance %.3f\n", avgYaw, motorBalance);
+        }
+      }
+      trimYawSum = 0;
+      trimRunTime = 0;
+    }
+  } else {
+    trimYawSum = 0;
+    trimRunTime = 0;
+  }
+  if (balanceDirty && millis() - lastBalanceSave > 5000) saveMotorBalance();
 
   float speed = 0;
   if (driveState == DRIVE_FORWARD) speed = FORWARD_SPEED_MM_S;
@@ -961,7 +1092,7 @@ void setupWifi() {
 // The heavy stuff (vosk + ollama) runs on the PC. The robot only posts
 // sensor state or a wav file and waits for a short json answer.
 void loadLaptopSettings() {
-  prefs.begin("maze", true);
+  prefs.begin("maze", false);
   String saved = prefs.getString("laptop", "");
   prefs.end();
   if (saved.length()) laptopHost = saved;
@@ -1135,9 +1266,12 @@ void handleWebRoot() {
   h += "<form action='/ask'>Ask laptop: <input name='q' size='18'> <input type='submit' value='Ask'></form>";
   h += "<p>Laptop says: <b>" + escHtml(lastAIAnswer) + "</b></p>";
   h += "<form action='/target'>Laptop IP <input name='host' value='" + laptopHost + "'> <input type='submit' value='Save'></form>";
+  String trimPct = String((motorBalance - 1.0f) * 100.0f, 1);
+  h += "<p>Trim R: <b>" + trimPct + "%</b> <a href='/trim?cal=1' onclick=\"return confirm('1.2m clear ahead?')\">calibrate</a> | <a href='/trim?reset=1'>reset</a></p>";
+  h += "<form action='/trim'>R <input name='b' size='4' value='" + trimPct + "'>% <input type='submit' value='Set'></form>";
   h += "<p>Sensors: <span id='s'>...</span></p>";
   h += "<p>Last voice: <b>" + escHtml(lastVoiceText) + "</b></p>";
-  h += "<script>setInterval(async()=>{try{const r=await fetch('/sensors');const j=await r.json();document.getElementById('s').textContent=j.front+'cm / '+j.left+'mm / '+j.right+'mm';}catch(e){}},1000);</script>";
+  h += "<script>setInterval(async()=>{try{const r=await fetch('/sensors');const j=await r.json();document.getElementById('s').textContent=j.front+'cm / '+j.left+'mm / '+j.right+'mm / trim '+j.trim+'%';}catch(e){}},1000);</script>";
   h += "</body></html>";
   webServer.send(200, "text/html", h);
 }
@@ -1158,6 +1292,21 @@ void handleWebCmd() {
 
 void handleWebSpeed() {
   webSpeed = constrain(webServer.arg("v").toInt(), 0, 255);
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+void handleWebTrim() {
+  if (webServer.hasArg("cal")) {
+    calibrateMotorBalance();
+  } else if (webServer.hasArg("reset")) {
+    motorBalance = 1.0f;
+    saveMotorBalance();
+  } else if (webServer.hasArg("b")) {
+    float pct = webServer.arg("b").toFloat();
+    motorBalance = constrain(1.0f + pct / 100.0f, 0.75f, 1.25f);
+    saveMotorBalance();
+  }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
 }
@@ -1199,7 +1348,7 @@ void handleWebSensors() {
   if (sensorRight.timeoutOccurred()) r = 65535;
   readUltrasonic();
   String j = "{\"front\":" + String(distanceFront, 1) + ",\"left\":" + String(l) +
-             ",\"right\":" + String(r) + "}";
+             ",\"right\":" + String(r) + ",\"trim\":" + String((motorBalance - 1.0f) * 100.0f, 2) + "}";
   webServer.send(200, "application/json", j);
 }
 
@@ -1207,6 +1356,7 @@ void setupWeb() {
   webServer.on("/", handleWebRoot);
   webServer.on("/cmd", handleWebCmd);
   webServer.on("/speed", handleWebSpeed);
+  webServer.on("/trim", handleWebTrim);
   webServer.on("/sensors", handleWebSensors);
   webServer.on("/ask", handleWebAsk);
   webServer.on("/target", handleWebTarget);
