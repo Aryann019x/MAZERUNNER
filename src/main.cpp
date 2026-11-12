@@ -396,6 +396,7 @@ void loop() {
 // -------------------- Page navigation --------------------
 void advancePage() {
   beep(1);
+  stopMotors(); // don't leave the last PWM running on a non-driving page
   if (voiceRec) voiceCancel(); // leaving the page mid-record drops it
   if (currentPage == VOICE_PAGE) deinitMic(); // free I2S: restores BTN1/GPIO0
   currentPage = (currentPage + 1) % totalPages;
