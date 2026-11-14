@@ -154,7 +154,7 @@ float gyroZBiasDegPerSec = 0;
 float gyroYawRate = 0; // deg/s, filtered gyro z, used by the neural page
 unsigned long lastPoseMicros = 0;
 
-// Right-wheel scale learned from the gyro. 1.0 = no correction. The motors
+// Left-wheel scale learned from the gyro. 1.0 = no correction. The motors
 // are never perfectly matched, so straight commands slowly drift; this trims
 // the faster side until the yaw rate sits near zero. Saved in NVS.
 float motorBalance = 1.0f;
@@ -162,12 +162,14 @@ bool balanceDirty = false;
 unsigned long lastBalanceSave = 0;
 bool straightCmd = false;
 float trimYawSum = 0, trimRunTime = 0;
+int pwmLeft = 0, pwmRight = 0; // last commanded wheel PWM, used for rough odometry
 
 // TUNE THESE: run moveForward(forwardSpeed,forwardSpeed) for exactly 2s on a
 // known-length straight run, measure distance traveled in mm, divide by 2.
 // Repeat for backward. These placeholders are almost certainly wrong for your robot.
 const float FORWARD_SPEED_MM_S = 250.0;
 const float BACKWARD_SPEED_MM_S = 250.0;
+const float SPEED_CAL_PWM = 150.0; // speed constants were measured at this PWM
 
 enum DriveState { DRIVE_STOPPED, DRIVE_FORWARD, DRIVE_BACKWARD, DRIVE_TURNING };
 DriveState driveState = DRIVE_STOPPED;
@@ -226,7 +228,7 @@ void updatePose();
 void predictPosition(float secondsAhead, float &predX, float &predY);
 void loadMotorBalance();
 void saveMotorBalance();
-int balancedRight(int pwm);
+int balancedLeft(int pwm);
 void calibrateMotorBalance();
 void handleWebTrim();
 void showVoicePage();
@@ -486,10 +488,10 @@ void updateEyeAnimation() {
       case 1: look_up(); break;
       case 2: wink(); break;
       case 3:
-        left_eye_x += random(-2,3);
-        left_eye_y += random(-2,3);
-        right_eye_x += random(-2,3);
-        right_eye_y += random(-2,3);
+        left_eye_x = constrain(left_eye_x + random(-2, 3), baseLeftEyeX - eyeOffsetMax, baseLeftEyeX + eyeOffsetMax);
+        left_eye_y = constrain(left_eye_y + random(-2, 3), baseLeftEyeY - eyeOffsetMax, baseLeftEyeY + eyeOffsetMax);
+        right_eye_x = constrain(right_eye_x + random(-2, 3), baseRightEyeX - eyeOffsetMax, baseRightEyeX + eyeOffsetMax);
+        right_eye_y = constrain(right_eye_y + random(-2, 3), baseRightEyeY - eyeOffsetMax, baseRightEyeY + eyeOffsetMax);
         break;
     }
   }
@@ -501,8 +503,8 @@ void updateEyesWithMPU() {
   float ax = a.acceleration.x, ay = a.acceleration.y, az = a.acceleration.z;
   float roll = atan2(ay, az) * 180.0 / PI;
   float pitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
-  int targetX = map((int)pitch, -30, 30, -eyeOffsetMax, eyeOffsetMax);
-  int targetY = map((int)roll, -30, 30, -eyeOffsetMax, eyeOffsetMax);
+  int targetX = constrain(map((int)pitch, -30, 30, -eyeOffsetMax, eyeOffsetMax), -eyeOffsetMax, eyeOffsetMax);
+  int targetY = constrain(map((int)roll, -30, 30, -eyeOffsetMax, eyeOffsetMax), -eyeOffsetMax, eyeOffsetMax);
   smoothLeftX += (baseLeftEyeX + targetX - smoothLeftX) * easingFactor;
   smoothLeftY += (baseLeftEyeY + targetY - smoothLeftY) * easingFactor;
   smoothRightX += (baseRightEyeX + targetX - smoothRightX) * easingFactor;
@@ -514,9 +516,11 @@ void updateEyesWithMPU() {
 }
 
 // -------------------- Motors --------------------
-// Motor A is the left wheel, motor B is the right one. Only the right side
-// gets the learned scale; it is the easiest place to hide the mismatch.
-int balancedRight(int pwm) {
+// Motor A is the physical right wheel, motor B is the left one. The turn
+// directions (A back / B forward = right) and the old firmware agree on this.
+// The learned trim scales the left side; if the sides are ever swapped, the
+// robot will curve away instead of straightening out.
+int balancedLeft(int pwm) {
   return constrain((int)lroundf(pwm * motorBalance), 0, 255);
 }
 
@@ -526,10 +530,12 @@ void moveForward(uint8_t left, uint8_t right) {
   digitalWrite(AIN2, LOW);
   digitalWrite(BIN1, HIGH);
   digitalWrite(BIN2, LOW);
-  ledcWrite(pwmChannelA, left);
-  ledcWrite(pwmChannelB, balancedRight(right));
+  ledcWrite(pwmChannelA, right);
+  ledcWrite(pwmChannelB, balancedLeft(left));
+  pwmLeft = balancedLeft(left);
+  pwmRight = right;
   straightCmd = (left == right && left > 0);
-  driveState = DRIVE_FORWARD;
+  driveState = (left == 0 && right == 0) ? DRIVE_STOPPED : DRIVE_FORWARD;
 }
 
 void moveBackward(uint8_t left, uint8_t right) {
@@ -538,10 +544,12 @@ void moveBackward(uint8_t left, uint8_t right) {
   digitalWrite(AIN2, HIGH);
   digitalWrite(BIN1, LOW);
   digitalWrite(BIN2, HIGH);
-  ledcWrite(pwmChannelA, left);
-  ledcWrite(pwmChannelB, balancedRight(right));
+  ledcWrite(pwmChannelA, right);
+  ledcWrite(pwmChannelB, balancedLeft(left));
+  pwmLeft = balancedLeft(left);
+  pwmRight = right;
   straightCmd = (left == right && left > 0);
-  driveState = DRIVE_BACKWARD;
+  driveState = (left == 0 && right == 0) ? DRIVE_STOPPED : DRIVE_BACKWARD;
 }
 
 // Starts a turn WITHOUT blocking. Call turnUpdate() every loop to finish it.
@@ -551,8 +559,10 @@ void turnRightStart(uint8_t left, uint8_t right) {
   digitalWrite(AIN2, HIGH);
   digitalWrite(BIN1, HIGH);
   digitalWrite(BIN2, LOW);
-  ledcWrite(pwmChannelA, left);
-  ledcWrite(pwmChannelB, right);
+  ledcWrite(pwmChannelA, right);
+  ledcWrite(pwmChannelB, left);
+  pwmLeft = left;
+  pwmRight = right;
   straightCmd = false;
   turnState = TURNING_RIGHT;
   turnStartTime = millis();
@@ -565,8 +575,10 @@ void turnLeftStart(uint8_t left, uint8_t right) {
   digitalWrite(AIN2, LOW);
   digitalWrite(BIN1, LOW);
   digitalWrite(BIN2, HIGH);
-  ledcWrite(pwmChannelA, left);
-  ledcWrite(pwmChannelB, right);
+  ledcWrite(pwmChannelA, right);
+  ledcWrite(pwmChannelB, left);
+  pwmLeft = left;
+  pwmRight = right;
   straightCmd = false;
   turnState = TURNING_LEFT;
   turnStartTime = millis();
@@ -595,28 +607,32 @@ void stopMotors() {
   digitalWrite(BIN2, LOW);
   digitalWrite(STBY, HIGH);
   straightCmd = false;
+  pwmLeft = pwmRight = 0;
   driveState = DRIVE_STOPPED;
   turnState = TURN_NONE;
 }
 
 // Direct wheel speeds, negative = backwards. Used by the neural page where
 // the two sides move independently instead of the usual forward/turn calls.
+// A is the right motor and B is the left one, so the arguments go in swapped.
 void setWheels(int left, int right) {
   left = constrain(left, -255, 255);
   right = constrain(right, -255, 255);
-  int r = (right >= 0) ? balancedRight(right) : -balancedRight(-right);
+  int l = (left >= 0) ? balancedLeft(left) : -balancedLeft(-left);
   digitalWrite(STBY, HIGH);
-  digitalWrite(AIN1, left >= 0 ? HIGH : LOW);
-  digitalWrite(AIN2, left >= 0 ? LOW : HIGH);
-  digitalWrite(BIN1, r >= 0 ? HIGH : LOW);
-  digitalWrite(BIN2, r >= 0 ? LOW : HIGH);
-  ledcWrite(pwmChannelA, abs(left));
-  ledcWrite(pwmChannelB, abs(r));
+  digitalWrite(AIN1, right >= 0 ? HIGH : LOW);
+  digitalWrite(AIN2, right >= 0 ? LOW : HIGH);
+  digitalWrite(BIN1, l >= 0 ? HIGH : LOW);
+  digitalWrite(BIN2, l >= 0 ? LOW : HIGH);
+  ledcWrite(pwmChannelA, abs(right));
+  ledcWrite(pwmChannelB, abs(l));
+  pwmLeft = abs(l);
+  pwmRight = abs(right);
   straightCmd = (left == right && left != 0);
   turnState = TURN_NONE;
-  if (left > 0 && r > 0) driveState = DRIVE_FORWARD;
-  else if (left < 0 && r < 0) driveState = DRIVE_BACKWARD;
-  else if (left == 0 && r == 0) driveState = DRIVE_STOPPED;
+  if (left > 0 && right > 0) driveState = DRIVE_FORWARD;
+  else if (left < 0 && right < 0) driveState = DRIVE_BACKWARD;
+  else if (left == 0 && right == 0) driveState = DRIVE_STOPPED;
   else driveState = DRIVE_TURNING;
 }
 
@@ -666,7 +682,7 @@ void showPosePage() {
   display.printf("X:   %.0f mm\n", pose.x);
   display.printf("Y:   %.0f mm\n", pose.y);
   display.printf("Hdg: %.1f deg\n", pose.heading);
-  display.printf("Trim R: %+.1f%%\n", (motorBalance - 1.0f) * 100.0f);
+  display.printf("Trim L: %+.1f%%\n", (motorBalance - 1.0f) * 100.0f);
   display.println("Predicted +1s:");
   display.printf("(%.0f, %.0f)\n", predX, predY);
   display.display();
@@ -775,7 +791,7 @@ void updateOLEDVL53(float front, uint16_t left, uint16_t right, const char* moto
   display.printf("Left : %s\n", (left != 65535) ? String(left).c_str() : "Out");
   display.printf("Right: %s\n", (right != 65535) ? String(right).c_str() : "Out");
   display.printf("Motor: %s\n", motorState);
-  display.printf("Trim R: %+.1f%%", (motorBalance - 1.0f) * 100.0f);
+  display.printf("Trim L: %+.1f%%", (motorBalance - 1.0f) * 100.0f);
   display.display();
 }
 
@@ -919,7 +935,7 @@ void calibrateGyroBias() {
   Serial.printf("Gyro Z bias: %.3f deg/s\n", gyroZBiasDegPerSec);
 }
 
-// 1.0 = right wheel untouched. The value is a multiplier, not an offset,
+// 1.0 = left wheel untouched. The value is a multiplier, not an offset,
 // so a motor that is 5% slow stays corrected at every speed.
 void loadMotorBalance() {
   prefs.begin("maze", false);
@@ -939,7 +955,7 @@ void saveMotorBalance() {
 }
 
 // Five short straight bursts in open space. Each one measures the average yaw
-// rate and nudges the right side until the robot stops turning on its own.
+// rate and nudges the left side until the robot stops turning on its own.
 void calibrateMotorBalance() {
   stopMotors();
   readUltrasonic();
@@ -963,7 +979,7 @@ void calibrateMotorBalance() {
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
     display.printf("TRIM RUN %d/5\n", run + 1);
-    display.printf("R %+.1f%%\n", (motorBalance - 1.0f) * 100.0f);
+    display.printf("L %+.1f%%\n", (motorBalance - 1.0f) * 100.0f);
     display.display();
 
     moveForward(130, 130);
@@ -992,7 +1008,17 @@ void calibrateMotorBalance() {
   currentPage = 4; // park on pose so nothing starts driving again
   showPosePage();
   beep(2);
-  Serial.printf("trim done: R %+.1f%%\n", (motorBalance - 1.0f) * 100.0f);
+  Serial.printf("trim done: L %+.1f%%\n", (motorBalance - 1.0f) * 100.0f);
+}
+
+// Rough translation speed from the last wheel command. The two speed
+// constants were measured at SPEED_CAL_PWM, so a faster web/laptop burst
+// doesn't pretend the robot is still crawling.
+float driveSpeedEstimate() {
+  if (driveState != DRIVE_FORWARD && driveState != DRIVE_BACKWARD) return 0;
+  float avgPwm = (pwmLeft + pwmRight) * 0.5f;
+  float speed = (driveState == DRIVE_FORWARD) ? FORWARD_SPEED_MM_S : -BACKWARD_SPEED_MM_S;
+  return speed * (avgPwm / SPEED_CAL_PWM);
 }
 
 // Integrates gyro yaw rate into heading, and (very roughly) advances x/y
@@ -1018,7 +1044,7 @@ void updatePose() {
   if (pose.heading < -180) pose.heading += 360;
 
   // Straight command + non-zero yaw = the wheels are not matched. Integrate
-  // the error over a second and trim the right side a little. Slow on
+  // the error over a second and trim the left side a little. Slow on
   // purpose: a bump or a single bad gyro sample shouldn't move the value.
   if (straightCmd && driveState == DRIVE_FORWARD) {
     trimYawSum += yawRateDegPerSec * dt;
@@ -1043,10 +1069,7 @@ void updatePose() {
   }
   if (balanceDirty && millis() - lastBalanceSave > 5000) saveMotorBalance();
 
-  float speed = 0;
-  if (driveState == DRIVE_FORWARD) speed = FORWARD_SPEED_MM_S;
-  else if (driveState == DRIVE_BACKWARD) speed = -BACKWARD_SPEED_MM_S;
-  // DRIVE_TURNING and DRIVE_STOPPED contribute no translation.
+  float speed = driveSpeedEstimate();
 
   if (speed != 0) {
     float headingRad = pose.heading * PI / 180.0f;
@@ -1059,9 +1082,7 @@ void updatePose() {
 // model, just physics. See chat notes on why this is the right first step
 // before a neural net.
 void predictPosition(float secondsAhead, float &predX, float &predY) {
-  float speed = 0;
-  if (driveState == DRIVE_FORWARD) speed = FORWARD_SPEED_MM_S;
-  else if (driveState == DRIVE_BACKWARD) speed = -BACKWARD_SPEED_MM_S;
+  float speed = driveSpeedEstimate();
   float headingRad = pose.heading * PI / 180.0f;
   predX = pose.x + speed * secondsAhead * cos(headingRad);
   predY = pose.y + speed * secondsAhead * sin(headingRad);
@@ -1108,6 +1129,7 @@ String escJson(const String& s) {
     if (c == '"') o += "'";
     else if (c == '\\') o += '/';
     else if (c == '\n' || c == '\r' || c == '\t') o += ' ';
+    else if ((unsigned char)c < 0x20) o += ' ';
     else o += c;
   }
   return o;
@@ -1115,19 +1137,40 @@ String escJson(const String& s) {
 
 String jsonField(const String& js, const char* key) {
   String pat = String("\"") + key + "\"";
-  int k = js.indexOf(pat);
-  if (k < 0) return "";
-  k = js.indexOf(':', k + pat.length());
-  if (k < 0) return "";
-  k = js.indexOf('"', k);
-  if (k < 0) return "";
-  int e = k + 1;
-  while (e < (int)js.length()) {
-    if (js[e] == '\\') { e += 2; continue; }
-    if (js[e] == '"') break;
-    e++;
+  int n = js.length();
+  int k = -1, from = 0;
+  // Find the key itself, not a copy of the name inside some other string.
+  while (true) {
+    k = js.indexOf(pat, from);
+    if (k < 0) return "";
+    int c = k + pat.length();
+    while (c < n && (js[c] == ' ' || js[c] == '\t' || js[c] == '\r' || js[c] == '\n')) c++;
+    if (c < n && js[c] == ':') break;
+    from = k + 1;
   }
-  return js.substring(k + 1, e);
+  int i = js.indexOf(':', k + pat.length());
+  if (i < 0) return "";
+  i++;
+  while (i < n && (js[i] == ' ' || js[i] == '\t' || js[i] == '\r' || js[i] == '\n')) i++;
+  if (i >= n) return "";
+
+  // String value: copy until the closing quote, skipping escapes.
+  if (js[i] == '"') {
+    int e = i + 1;
+    while (e < n) {
+      if (js[e] == '\\') { e += 2; continue; }
+      if (js[e] == '"') break;
+      e++;
+    }
+    return js.substring(i + 1, e);
+  }
+
+  // Number/bool/null: stop at the next structural character.
+  int e = i;
+  while (e < n && js[e] != ',' && js[e] != '}' && js[e] != ']') e++;
+  String v = js.substring(i, e);
+  v.trim();
+  return v;
 }
 
 String httpPostJson(const String& url, const String& body, int* code) {
@@ -1210,15 +1253,17 @@ void laptopDrive() {
 
   int code = 0;
   String resp = httpPostJson("http://" + laptopHost + ":5000/drive", body, &code);
-  if (code <= 0) {
+  if (code <= 0 || code >= 400) {
     stopMotors();
-    lastLaptopAction = "laptop offline";
-    lastLaptopThought = "run server.py on the pc";
+    lastLaptopAction = code ? "laptop error" : "laptop offline";
+    lastLaptopThought = code ? (String("http ") + String(code)) : String("run server.py on the pc");
     showLaptopPage();
     return;
   }
 
   String action = jsonField(resp, "action");
+  action.trim();
+  action.toLowerCase();
   int speed = jsonField(resp, "speed").toInt();
   if (speed < 60 || speed > 220) speed = 140;
   String thought = jsonField(resp, "thought");
@@ -1251,6 +1296,8 @@ String escHtml(const String& s) {
   o.replace("&", "&amp;");
   o.replace("<", "&lt;");
   o.replace(">", "&gt;");
+  o.replace("\"", "&quot;");
+  o.replace("'", "&#39;");
   return o;
 }
 
@@ -1266,10 +1313,10 @@ void handleWebRoot() {
   h += "<p>Laptop: <b>" + escHtml(laptopHost.length() ? laptopHost : "not set") + "</b></p>";
   h += "<form action='/ask'>Ask laptop: <input name='q' size='18'> <input type='submit' value='Ask'></form>";
   h += "<p>Laptop says: <b>" + escHtml(lastAIAnswer) + "</b></p>";
-  h += "<form action='/target'>Laptop IP <input name='host' value='" + laptopHost + "'> <input type='submit' value='Save'></form>";
+  h += "<form action='/target'>Laptop IP <input name='host' value='" + escHtml(laptopHost) + "'> <input type='submit' value='Save'></form>";
   String trimPct = String((motorBalance - 1.0f) * 100.0f, 1);
-  h += "<p>Trim R: <b>" + trimPct + "%</b> <a href='/trim?cal=1' onclick=\"return confirm('1.2m clear ahead?')\">calibrate</a> | <a href='/trim?reset=1'>reset</a></p>";
-  h += "<form action='/trim'>R <input name='b' size='4' value='" + trimPct + "'>% <input type='submit' value='Set'></form>";
+  h += "<p>Trim L: <b>" + trimPct + "%</b> <a href='/trim?cal=1' onclick=\"return confirm('1.2m clear ahead?')\">calibrate</a> | <a href='/trim?reset=1'>reset</a></p>";
+  h += "<form action='/trim'>L <input name='b' size='4' value='" + trimPct + "'>% <input type='submit' value='Set'></form>";
   h += "<p>Sensors: <span id='s'>...</span></p>";
   h += "<p>Last voice: <b>" + escHtml(lastVoiceText) + "</b></p>";
   h += "<script>setInterval(async()=>{try{const r=await fetch('/sensors');const j=await r.json();document.getElementById('s').textContent=j.front+'cm / '+j.left+'mm / '+j.right+'mm / trim '+j.trim+'%';}catch(e){}},1000);</script>";
@@ -1316,13 +1363,20 @@ void handleWebAsk() {
   String q = webServer.arg("q");
   q.trim();
   lastAIAnswer = "";
-  if (q.length() && laptopHost.length()) {
+  if (!q.length()) {
+    lastAIAnswer = "type a question first";
+  } else if (!laptopHost.length()) {
+    lastAIAnswer = "set the laptop ip first";
+  } else {
     int code = 0;
     String resp = httpPostJson("http://" + laptopHost + ":5000/ask",
                                "{\"question\":\"" + escJson(q) + "\"}", &code);
-    lastAIAnswer = (code > 0) ? jsonField(resp, "response") : "laptop offline";
-  } else if (!laptopHost.length()) {
-    lastAIAnswer = "set the laptop ip first";
+    if (code <= 0) lastAIAnswer = "laptop offline";
+    else if (code >= 400) lastAIAnswer = String("laptop error ") + code;
+    else {
+      lastAIAnswer = jsonField(resp, "response");
+      if (!lastAIAnswer.length()) lastAIAnswer = "empty reply";
+    }
   }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
@@ -1389,7 +1443,10 @@ bool initMic() {
     .data_in_num = I2S_SD
   };
   if (i2s_driver_install(I2S_PORT, &cfg, 0, NULL) != ESP_OK) return false;
-  if (i2s_set_pin(I2S_PORT, &pins) != ESP_OK) return false;
+  if (i2s_set_pin(I2S_PORT, &pins) != ESP_OK) {
+    i2s_driver_uninstall(I2S_PORT);
+    return false;
+  }
   i2s_zero_dma_buffer(I2S_PORT);
   micOk = true;
   Serial.println("mic ready: SCK=10 WS=11 SD=12 @16kHz");
@@ -1558,6 +1615,8 @@ void voiceFinishSend() {
   }
   Serial.println();
   Serial.printf("AUDEND %u\n", (unsigned)n);
+  if (voiceBufAlloc) { free(voiceBufAlloc); voiceBufAlloc = nullptr; voiceBuf = nullptr; }
+  voiceCap = voiceLen = 0;
   voiceStatus = V_WAITING;
   voiceWaitStart = millis();
   showVoicePage();
@@ -1597,7 +1656,7 @@ void voiceSendWifi() {
   if (voiceBufAlloc) { free(voiceBufAlloc); voiceBufAlloc = nullptr; voiceBuf = nullptr; }
   voiceCap = voiceLen = 0;
 
-  if (code <= 0) {
+  if (code <= 0 || code >= 400) {
     voiceStatus = V_NOLINK;
     Serial.printf("voice wifi failed, code %d\n", code);
     showVoicePage();
