@@ -1000,7 +1000,7 @@ void calibrateMotorBalance() {
 
     float avgYaw = yawN ? (yawSum / yawN) : 0;
     float step = constrain(avgYaw * 0.0015f, -0.03f, 0.03f);
-    motorBalance = constrain(motorBalance - step, 0.75f, 1.25f);
+    motorBalance = constrain(motorBalance + step, 0.75f, 1.25f);
     Serial.printf("trim run %d: yaw %.1f -> %.3f\n", run + 1, avgYaw, motorBalance);
   }
 
@@ -1052,8 +1052,11 @@ void updatePose() {
     if (trimRunTime >= 1.0f) {
       float avgYaw = trimYawSum / trimRunTime;
       if (fabs(avgYaw) > 1.5f) {
+        // Positive yaw = turning left (CCW), so the left wheel is the slow
+        // one and its scale has to go up. Flipping the trim to the other
+        // wheel means flipping this sign too.
         float step = constrain(avgYaw * 0.0015f, -0.025f, 0.025f);
-        float nextBalance = constrain(motorBalance - step, 0.75f, 1.25f);
+        float nextBalance = constrain(motorBalance + step, 0.75f, 1.25f);
         if (fabs(nextBalance - motorBalance) > 0.0005f) {
           motorBalance = nextBalance;
           balanceDirty = true;
