@@ -72,9 +72,31 @@ python ml/train_policy.py
 
 That regenerates `include/nn_policy.h` with int8 weights. Inference in `src/nn_policy.cpp` uses floats. A hard stop kicks in below 70 mm on the front sensor, no matter what the network says.
 
+The training set is mirrored sample by sample, so the net can't learn a left/right bias from sampling noise. The teacher also spins in place when the front is blocked and both side sensors read the same, instead of creeping into the wall.
+
+### Simulator and RL
+
+`ml/sim.py` is a small differential-drive simulator with the same 8 inputs and the same 25 Hz command smoothing as the firmware. It has two maze styles (`rooms`, `s_curve`) and adds sensor noise, motor mismatch and ray-cast wall collisions:
+
+```
+python ml/sim.py --episodes 3 --render
+python ml/sim.py --kind s_curve --seed 0
+python ml/test_sim.py
+```
+
+`ml/train_rl.py` optimises the same 8 → 32 → 24 → 2 net with CEM. It starts from the supervised header by default, so it is a fine-tune rather than a from-scratch run:
+
+```
+python ml/train_rl.py --generations 20
+python ml/train_rl.py --init random --generations 100
+python ml/train_rl.py --no-write
+```
+
+The RL trainer only overwrites `include/nn_policy.h` when the candidate beats the current supervised policy on held-out mazes. `--force` skips that check. Treat the result as a simulator result: the real robot still needs a run on the floor before it is trusted.
+
 ### Motor trim
 
-The two gear motors never run at exactly the same speed, so a straight command slowly drifts. While the robot is driving straight, the firmware averages the gyro yaw rate over a second and nudges a scale factor on the right wheel until the heading stops drifting. The value is saved in NVS and shown on the Pose page.
+The two gear motors never run at exactly the same speed, so a straight command slowly drifts. While the robot is driving straight, the firmware averages the gyro yaw rate over a second and nudges a scale factor on the **left** wheel (motor B) until the heading stops drifting. Motor A is the physical right wheel and motor B is the left one. The value is saved in NVS and shown on the Pose page.
 
 The web page can reset it, set it by hand, or run a calibration: five short straight bursts in open space (about 1.2 m ahead is enough), re-checking the gyro bias first. Normal driving keeps fine-tuning it afterwards.
 
@@ -108,9 +130,10 @@ Working:
 - Motor control, all sensor reads, OLED menu, eye animations, basic obstacle avoidance
 - Neural wall follower and pose dead reckoning
 - Wi-Fi web control, voice page, laptop LLM bridge
+- Simulator and CEM training for the neural policy
 
 Needs work:
-- Non-blocking turn timing (currently uses delays)
+- Real-maze validation of the motor-side fix and learned trim
 - Better neural training data (the teacher is still pretty simple)
 - Cleaner laptop page (one decision every 2 s is slow)
 
