@@ -9,6 +9,7 @@ Runs forever. No WiFi needed for this part, just USB serial.
 """
 import argparse
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -19,6 +20,10 @@ import serial
 from vosk import Model, KaldiRecognizer, SetLogLevel
 
 SAMPLE_RATE = 16000
+DEFAULT_VOSK = os.environ.get(
+    "VOSK_MODEL", r"C:\Users\aryan\vosk-model-small-en-us-0.15"
+)
+DEFAULT_WAV_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice_logs")
 
 
 def wait_and_capture(ser, timeout: float) -> bytes:
@@ -63,6 +68,7 @@ def wait_and_capture(ser, timeout: float) -> bytes:
 
 
 def save_wav(pcm: bytes, path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with wave.open(path, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
@@ -97,8 +103,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", default="COM3")
     ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--model", default=r"C:\Users\gamar\vosk-model-small-en-us-0.15")
+    ap.add_argument("--model", default=DEFAULT_VOSK)
     ap.add_argument("--ollama-model", default="qwen2.5:3b")
+    ap.add_argument("--wav-dir", default=DEFAULT_WAV_DIR)
     args = ap.parse_args()
 
     SetLogLevel(-1)
@@ -121,7 +128,7 @@ def main() -> int:
             continue
 
         round_n += 1
-        wav_path = rf"D:\MAZERUNNER\voice_{round_n}.wav"
+        wav_path = os.path.join(args.wav_dir, f"voice_{round_n}.wav")
         save_wav(pcm, wav_path)
 
         rec = KaldiRecognizer(model, SAMPLE_RATE)

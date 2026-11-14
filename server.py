@@ -22,14 +22,22 @@ import wave
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # a voice clip is ~160 KB
 
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
 VOSK_MODEL = os.environ.get(
     "VOSK_MODEL", r"C:\Users\aryan\vosk-model-small-en-us-0.15"
 )
 _vosk = None
+_vosk_lock = threading.Lock()
 
 ACTIONS = ("forward", "backward", "left", "right", "stop")
+
+# The robot gives up at 20 s (/ask, /drive) and 30 s (/stt), so keep the
+# model work a little under those limits instead of answering into the void.
+ASK_TIMEOUT = 18
+DRIVE_TIMEOUT = 18
+STT_TIMEOUT = 25
 
 
 def ask_ollama(prompt: str, timeout: int = 60) -> str:
@@ -49,16 +57,37 @@ def ask_ollama(prompt: str, timeout: int = 60) -> str:
 
 
 def clean(text: str, limit: int = 400) -> str:
-    return text.replace('"', "'").replace("\n", " ").strip()[:limit]
+    return text.replace('"', "'").replace("\r", " ").replace("\n", " ").strip()[:limit]
+
+
+def json_body() -> dict:
+    """Flask returns None/list for malformed or non-object bodies."""
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+def number(data: dict, key: str, default: float = 999.0) -> float:
+    try:
+        return float(data.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_vosk():
+    """Load the model once, even if warmup and a request race."""
+    global _vosk
+    if _vosk is None:
+        with _vosk_lock:
+            if _vosk is None:
+                from vosk import Model, SetLogLevel
+
+                SetLogLevel(-1)
+                _vosk = Model(VOSK_MODEL)
+    return _vosk
 
 
 def transcribe(wav_bytes: bytes) -> str:
-    global _vosk
-    if _vosk is None:
-        from vosk import Model, SetLogLevel
-
-        SetLogLevel(-1)
-        _vosk = Model(VOSK_MODEL)
+    model = get_vosk()
 
     from vosk import KaldiRecognizer
 
@@ -66,7 +95,7 @@ def transcribe(wav_bytes: bytes) -> str:
         frames = w.readframes(w.getnframes())
         rate = w.getframerate()
 
-    rec = KaldiRecognizer(_vosk, rate)
+    rec = KaldiRecognizer(model, rate)
     rec.AcceptWaveform(frames)
     return json.loads(rec.FinalResult()).get("text", "").strip()
 
@@ -90,13 +119,13 @@ def health():
 
 @app.route("/ask", methods=["POST"])
 def ask():
-    data = request.get_json(silent=True) or {}
-    question = data.get("question", "")
+    data = json_body()
+    question = str(data.get("question", "")).strip()
     if not question:
         return jsonify({"response": "No question received."})
 
-    prompt = "Answer briefly in at most 3 short sentences. " + question
-    reply = ask_ollama(prompt, timeout=45)
+    prompt = "Answer briefly in at most 3 short sentences. " + question[:500]
+    reply = ask_ollama(prompt, timeout=ASK_TIMEOUT)
     if not reply:
         reply = "Error: ollama returned nothing."
     return jsonify({"response": clean(reply)})
@@ -112,7 +141,7 @@ def stt():
     if not text:
         return jsonify({"text": "", "reply": "say it again?"})
 
-    reply = ask_ollama("Answer briefly in at most 3 short sentences. " + text)
+    reply = ask_ollama("Answer briefly in at most 3 short sentences. " + text, timeout=STT_TIMEOUT)
     if not reply:
         reply = "ollama is not answering"
     print(f"heard: {text}\nreply: {reply}", flush=True)
@@ -121,11 +150,11 @@ def stt():
 
 @app.route("/drive", methods=["POST"])
 def drive():
-    d = request.get_json(silent=True) or {}
-    front = float(d.get("front", 999))
-    left = float(d.get("left", 999))
-    right = float(d.get("right", 999))
-    heading = float(d.get("heading", 0))
+    d = json_body()
+    front = number(d, "front")
+    left = number(d, "left")
+    right = number(d, "right")
+    heading = number(d, "heading", 0.0)
 
     prompt = (
         "You drive a small maze robot. Distances in mm, 999 means clear. "
@@ -133,14 +162,14 @@ def drive():
         "Pick one: forward, backward, left, right, stop.\n"
         'Reply with json only: {"action":"forward","speed":140,"thought":"short"}'
     )
-    raw = ask_ollama(prompt, timeout=30)
+    raw = ask_ollama(prompt, timeout=DRIVE_TIMEOUT)
 
     action = ""
     speed = 140
     thought = ""
-    m = re.search(r'"action"\s*:\s*"([a-z]+)"', raw)
+    m = re.search(r'"action"\s*:\s*"([a-z]+)"', raw, re.I)
     if m:
-        action = m.group(1)
+        action = m.group(1).lower()
     m = re.search(r'"speed"\s*:\s*(\d+)', raw)
     if m:
         speed = int(m.group(1))
@@ -170,12 +199,8 @@ def drive():
 
 def warmup():
     """Load vosk and the ollama model so the first robot request is fast."""
-    global _vosk
     try:
-        from vosk import Model, SetLogLevel
-
-        SetLogLevel(-1)
-        _vosk = Model(VOSK_MODEL)
+        get_vosk()
         print("vosk model loaded", flush=True)
     except Exception as e:
         print(f"vosk warmup failed: {e}", flush=True)

@@ -40,3 +40,4 @@ aksflask.cpp
 include/wifi_config.h
 capture_*.wav
 voice_*.wav
+voice_logs/
