@@ -255,6 +255,14 @@ void showWrapped(const String& title, const String& body);
 
 void setup() {
   Serial.begin(115200);
+
+  // Both ToF sensors come up at the same address and can hold the shared
+  // I2C bus low. Park them in shutdown before the OLED or MPU talk, or the
+  // whole bus looks dead and setup() stops at "MPU6050 not found".
+  sensorPowerDown(XSHUT_PIN1);
+  sensorPowerDown(XSHUT_PIN2);
+  delay(20);
+
   pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
   pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
   pinMode(STBY, OUTPUT); digitalWrite(STBY, HIGH);
@@ -939,7 +947,7 @@ void calibrateGyroBias() {
 // so a motor that is 5% slow stays corrected at every speed.
 void loadMotorBalance() {
   prefs.begin("maze", false);
-  motorBalance = prefs.getFloat("balance", 1.0f);
+  motorBalance = prefs.isKey("balance") ? prefs.getFloat("balance", 1.0f) : 1.0f;
   prefs.end();
   motorBalance = constrain(motorBalance, 0.75f, 1.25f);
   Serial.printf("motor balance: %.3f\n", motorBalance);
@@ -1118,7 +1126,7 @@ void setupWifi() {
 // sensor state or a wav file and waits for a short json answer.
 void loadLaptopSettings() {
   prefs.begin("maze", false);
-  String saved = prefs.getString("laptop", "");
+  String saved = prefs.isKey("laptop") ? prefs.getString("laptop", "") : "";
   prefs.end();
   if (saved.length()) laptopHost = saved;
   Serial.printf("laptop host: %s\n", laptopHost.length() ? laptopHost.c_str() : "(not set)");
