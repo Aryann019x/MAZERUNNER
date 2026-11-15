@@ -13,6 +13,8 @@
 #include <WebServer.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
+#include <ESPmDNS.h>
+#include <ArduinoOTA.h>
 #include <driver/i2s.h>
 
 // Local creds live in include/wifi_config.h (untracked). Empty = AP only.
@@ -23,6 +25,9 @@
 #define WIFI_PASS ""
 #define AP_SSID "MazeRunner"
 #define AP_PASS "mazerunner123"
+#endif
+#ifndef OTA_PASS
+#define OTA_PASS "mazerunner"
 #endif
 
 // IP of the laptop running server.py. Can be changed from the web page.
@@ -66,7 +71,27 @@
 
 const int pwmChannelA = 0, pwmChannelB = 1, buzzerChannel = 2;
 const int pwmFreq = 5000, pwmRes = 8;
-const unsigned long turn90Time = 190;
+
+// Both motor leads are wired opposite to the TB6612's usual "forward"
+// combination: IN1=HIGH, IN2=LOW drives the wheels backwards on this robot.
+// These are the levels that actually move the robot toward the HC-SR04 end.
+// If the motor plugs are ever swapped, flip FWD1/FWD2 and REV1/REV2.
+const int MOTOR_FWD1 = LOW;
+const int MOTOR_FWD2 = HIGH;
+const int MOTOR_REV1 = HIGH;
+const int MOTOR_REV2 = LOW;
+
+// Translation-only direction trim, saved in NVS. The spin directions are
+// calibrated separately, so this must not touch setSpinPins/setWheels.
+bool driveInvert = false;
+
+inline void setTranslateDir(bool forward) {
+  bool f = forward != driveInvert;
+  digitalWrite(AIN1, f ? MOTOR_FWD1 : MOTOR_REV1);
+  digitalWrite(AIN2, f ? MOTOR_FWD2 : MOTOR_REV2);
+  digitalWrite(BIN1, f ? MOTOR_FWD1 : MOTOR_REV1);
+  digitalWrite(BIN2, f ? MOTOR_FWD2 : MOTOR_REV2);
+}
 
 int ref_eye_height = 40, ref_eye_width = 40, ref_space_between_eye = 10, ref_corner_radius = 10;
 int baseLeftEyeX, baseLeftEyeY, baseRightEyeX, baseRightEyeY;
@@ -109,7 +134,15 @@ Adafruit_MPU6050 mpu;
 WebServer webServer(80);
 
 // -------------------- Web control state --------------------
-int webSpeed = 150; // 0..255, set from the site slider
+int webSpeed = 130; // 0..255, manual drive speed
+char webHoldDir = 'S'; // F/B/L/R while a page button is held, S = stopped
+unsigned long webHoldLast = 0;
+bool otaReady = false;
+bool netServicesStarted = false;
+unsigned long wifiRetryAt = 0;
+String apIP = "192.168.4.1";
+String wifiSsid = WIFI_SSID;
+String wifiPass = WIFI_PASS;
 String lastVoiceText = ""; // last YOU/AI text from the PC script, shown on site + voice page
 String botIP = "no wifi";
 String laptopHost = LAPTOP_HOST; // server.py machine, settable from the web page
@@ -135,9 +168,17 @@ String voiceHeard = ""; // what Vosk heard
 String voiceReply = ""; // what ollama answered
 
 // -------------------- Non-blocking turn state --------------------
-enum TurnState { TURN_NONE, TURNING_LEFT, TURNING_RIGHT };
-TurnState turnState = TURN_NONE;
+// Spins are closed-loop on the gyro so a 90 degree turn is actually 90
+// degrees instead of "however far the wheels got in 190 ms".
+bool turnActive = false;
+bool turnCcw = true;
+bool turnPolarityChecked = false;
+bool turnFault = false; // gyro says the spin went the wrong way -> stop, don't flip
+uint8_t turnSpeedPwm = 0;
+float turnStartHeading = 0;
+float turnTargetDeg = 90;
 unsigned long turnStartTime = 0;
+const unsigned long TURN_MAX_MS = 3200; // stuck against something -> give up
 
 // -------------------- Dead-reckoning pose state --------------------
 // NOTE: with no wheel encoders, x/y are rough estimates based on an assumed
@@ -164,6 +205,13 @@ bool straightCmd = false;
 float trimYawSum = 0, trimRunTime = 0;
 int pwmLeft = 0, pwmRight = 0; // last commanded wheel PWM, used for rough odometry
 
+// Bench straight-line test (!S): drives at a fixed PWM for 2 s without any
+// steering, so the heading change shows the raw wheel imbalance.
+bool straightTestActive = false;
+unsigned long straightTestStart = 0;
+float straightTestHeading = 0;
+int straightTestPwm = 100;
+
 // TUNE THESE: run moveForward(forwardSpeed,forwardSpeed) for exactly 2s on a
 // known-length straight run, measure distance traveled in mm, divide by 2.
 // Repeat for backward. These placeholders are almost certainly wrong for your robot.
@@ -178,13 +226,7 @@ DriveState driveState = DRIVE_STOPPED;
 static float nnOutL = 0, nnOutR = 0;
 static float nnPrevL = 800, nnPrevR = 800;
 
-// Debounce: require N consecutive "obstacle" readings before acting on them.
-// A single glitchy VL53L0X reading (crosstalk between the two side sensors,
-// a stray reflection, etc.) used to be enough to trigger a full turn. This
-// is the direct fix for spurious repeated turning with nothing actually there.
-const int OBSTACLE_CONFIRM_COUNT = 3;
-int leftObstacleStreak = 0;
-int rightObstacleStreak = 0;
+// Debounce the front readings: a single echo dropout should not start a turn.
 int frontObstacleStreak = 0;
 
 // Function declarations
@@ -193,8 +235,10 @@ void startMelody();
 void updateMelody();
 void moveForward(uint8_t left, uint8_t right);
 void moveBackward(uint8_t left, uint8_t right);
-void turnRightStart(uint8_t left, uint8_t right);
-void turnLeftStart(uint8_t left, uint8_t right);
+void startTurn(bool ccw, uint8_t speed, float degrees);
+void spinCCW(uint8_t speed, unsigned long ms);
+void spinCW(uint8_t speed, unsigned long ms);
+void brakeMotors(uint16_t ms);
 bool turnUpdate();
 void stopMotors();
 void draw_eyes();
@@ -218,6 +262,10 @@ String httpPostWav(const String& url, const uint8_t* data, size_t len, int* code
 String jsonField(const String& js, const char* key);
 String escJson(const String& s);
 void ultrasonicHybridDrive();
+void autoReset();
+void startStraightTest(int pwm);
+void straightTestUpdate();
+void saveDriveInvert();
 void sensorPowerDown(int pin);
 void sensorPowerUp(int pin);
 void initSensors();
@@ -251,7 +299,10 @@ void voiceCancel();
 void voiceFinishSend();
 void voiceSendWifi();
 void pollSerialReply();
+void handleSerialCmd(char c);
 void showWrapped(const String& title, const String& body);
+void webDriveApply();
+void wifiLoop();
 
 void setup() {
   Serial.begin(115200);
@@ -358,7 +409,11 @@ void loop() {
   prevBtn1 = btn1;
   prevBtn2 = btn2;
 
-  if(currentPage == 1) {
+  if (webHoldDir != 'S') {
+    webDriveApply();
+  } else if (straightTestActive) {
+    straightTestUpdate();
+  } else if(currentPage == 1) {
     stopMotors();
   } else if(currentPage == 2) {
     updateEyesWithMPU();
@@ -400,6 +455,8 @@ void loop() {
     stopMotors();
   }
   webServer.handleClient(); // control site, cheap to poll
+  wifiLoop(); // background hotspot join / retry
+  if (otaReady) ArduinoOTA.handle();
   pollSerialReply(); // TXTHDR answers from the PC script, any page
 }
 
@@ -420,7 +477,7 @@ void advancePage() {
       draw_eyes();
       display.display();
       break;
-    case 3: break; // Autonomous Drive renders itself continuously below
+    case 3: autoReset(); break; // Autonomous Drive renders itself continuously below
     case 4: showPosePage(); break;
     case 5:
       nnOutL = nnOutR = 0;
@@ -524,9 +581,10 @@ void updateEyesWithMPU() {
 }
 
 // -------------------- Motors --------------------
-// Motor A is the physical right wheel, motor B is the left one. The turn
-// directions (A back / B forward = right) and the old firmware agree on this.
-// The learned trim scales the left side; if the sides are ever swapped, the
+// Motor A is the physical LEFT wheel, motor B is the RIGHT one. The motor
+// leads are also wired opposite to the TB6612 convention, so every direction
+// write goes through the MOTOR_FWD* and MOTOR_REV* levels defined above. The
+// learned trim scales the left (A) side; if the sides are ever swapped, the
 // robot will curve away instead of straightening out.
 int balancedLeft(int pwm) {
   return constrain((int)lroundf(pwm * motorBalance), 0, 255);
@@ -534,12 +592,9 @@ int balancedLeft(int pwm) {
 
 void moveForward(uint8_t left, uint8_t right) {
   digitalWrite(STBY, HIGH);
-  digitalWrite(AIN1, HIGH);
-  digitalWrite(AIN2, LOW);
-  digitalWrite(BIN1, HIGH);
-  digitalWrite(BIN2, LOW);
-  ledcWrite(pwmChannelA, right);
-  ledcWrite(pwmChannelB, balancedLeft(left));
+  setTranslateDir(true);
+  ledcWrite(pwmChannelA, balancedLeft(left));
+  ledcWrite(pwmChannelB, right);
   pwmLeft = balancedLeft(left);
   pwmRight = right;
   straightCmd = (left == right && left > 0);
@@ -548,59 +603,105 @@ void moveForward(uint8_t left, uint8_t right) {
 
 void moveBackward(uint8_t left, uint8_t right) {
   digitalWrite(STBY, HIGH);
-  digitalWrite(AIN1, LOW);
-  digitalWrite(AIN2, HIGH);
-  digitalWrite(BIN1, LOW);
-  digitalWrite(BIN2, HIGH);
-  ledcWrite(pwmChannelA, right);
-  ledcWrite(pwmChannelB, balancedLeft(left));
+  setTranslateDir(false);
+  ledcWrite(pwmChannelA, balancedLeft(left));
+  ledcWrite(pwmChannelB, right);
   pwmLeft = balancedLeft(left);
   pwmRight = right;
   straightCmd = (left == right && left > 0);
   driveState = (left == 0 && right == 0) ? DRIVE_STOPPED : DRIVE_BACKWARD;
 }
 
-// Starts a turn WITHOUT blocking. Call turnUpdate() every loop to finish it.
-void turnRightStart(uint8_t left, uint8_t right) {
+void setSpinPins(bool ccw, uint8_t speed) {
   digitalWrite(STBY, HIGH);
-  digitalWrite(AIN1, LOW);
-  digitalWrite(AIN2, HIGH);
-  digitalWrite(BIN1, HIGH);
-  digitalWrite(BIN2, LOW);
-  ledcWrite(pwmChannelA, right);
-  ledcWrite(pwmChannelB, left);
-  pwmLeft = left;
-  pwmRight = right;
+  if (ccw) {
+    // Nose left: left wheel (A) back, right wheel (B) forward.
+    digitalWrite(AIN1, MOTOR_REV1);
+    digitalWrite(AIN2, MOTOR_REV2);
+    digitalWrite(BIN1, MOTOR_FWD1);
+    digitalWrite(BIN2, MOTOR_FWD2);
+  } else {
+    // Nose right: left wheel (A) forward, right wheel (B) back.
+    digitalWrite(AIN1, MOTOR_FWD1);
+    digitalWrite(AIN2, MOTOR_FWD2);
+    digitalWrite(BIN1, MOTOR_REV1);
+    digitalWrite(BIN2, MOTOR_REV2);
+  }
+  ledcWrite(pwmChannelA, speed);
+  ledcWrite(pwmChannelB, speed);
+  pwmLeft = pwmRight = speed;
+}
+
+// Starts a gyro-closed-loop spin. ccw = nose left (positive gyro yaw).
+// A is the left wheel and B is the right one. CCW means the right wheel goes
+// forward and the left goes backward; CW is the reverse. The MOTOR_FWD*/
+// MOTOR_REV* levels already account for this robot's reversed motor leads.
+// If the gyro ever sees the chassis rotating the wrong way, turnUpdate stops
+// the spin and raises turnFault instead of flipping directions mid-turn.
+void startTurn(bool ccw, uint8_t speed, float degrees) {
+  setSpinPins(ccw, speed);
   straightCmd = false;
-  turnState = TURNING_RIGHT;
+  turnCcw = ccw;
+  turnTargetDeg = degrees;
+  turnStartHeading = pose.heading;
   turnStartTime = millis();
+  turnActive = true;
+  turnPolarityChecked = false;
+  turnFault = false;
+  turnSpeedPwm = speed;
   driveState = DRIVE_TURNING;
 }
 
-void turnLeftStart(uint8_t left, uint8_t right) {
+// Short brake: both inputs high on the TB6612. Coasting after a spin is what
+// made the old timed turns overshoot depending on the floor.
+void brakeMotors(uint16_t ms) {
   digitalWrite(STBY, HIGH);
-  digitalWrite(AIN1, HIGH);
-  digitalWrite(AIN2, LOW);
-  digitalWrite(BIN1, LOW);
-  digitalWrite(BIN2, HIGH);
-  ledcWrite(pwmChannelA, right);
-  ledcWrite(pwmChannelB, left);
-  pwmLeft = left;
-  pwmRight = right;
-  straightCmd = false;
-  turnState = TURNING_LEFT;
-  turnStartTime = millis();
-  driveState = DRIVE_TURNING;
+  digitalWrite(AIN1, HIGH); digitalWrite(AIN2, HIGH);
+  digitalWrite(BIN1, HIGH); digitalWrite(BIN2, HIGH);
+  ledcWrite(pwmChannelA, 255);
+  ledcWrite(pwmChannelB, 255);
+  delay(ms);
+  stopMotors();
 }
 
-// Non-blocking: returns true while a turn is still in progress.
-// Call this at the top of any drive loop; if it returns true, skip
-// re-reading sensors / re-deciding this cycle.
+// Blocking manual spins for the web/laptop buttons. Auto mode uses startTurn
+// plus turnUpdate so the loop keeps running.
+void spinCCW(uint8_t speed, unsigned long ms) {
+  startTurn(true, speed, 999);
+  delay(ms);
+  brakeMotors(30);
+}
+
+void spinCW(uint8_t speed, unsigned long ms) {
+  startTurn(false, speed, 999);
+  delay(ms);
+  brakeMotors(30);
+}
+
+// Non-blocking: returns true while the spin is still in progress.
 bool turnUpdate() {
-  if (turnState == TURN_NONE) return false;
-  if (millis() - turnStartTime >= turn90Time) {
-    stopMotors();
-    turnState = TURN_NONE;
+  if (!turnActive) return false;
+  float delta = pose.heading - turnStartHeading;
+  while (delta > 180) delta -= 360;
+  while (delta < -180) delta += 360;
+  float progress = turnCcw ? delta : -delta;
+  if (!turnPolarityChecked && millis() - turnStartTime > 300) {
+    turnPolarityChecked = true;
+    if (progress < -1.5f) {
+      // A wrong-way spin in a 15 cm corridor can put a corner through the
+      // wall. Stop and let auto halt instead of flipping the motor pins.
+      Serial.println("turn polarity fault");
+      brakeMotors(40);
+      turnActive = false;
+      turnFault = true;
+      return false;
+    }
+  }
+  if (progress >= turnTargetDeg || millis() - turnStartTime >= TURN_MAX_MS) {
+    bool stuck = (millis() - turnStartTime >= TURN_MAX_MS);
+    brakeMotors(45);
+    turnActive = false;
+    if (stuck) Serial.println("turn timeout");
     return false;
   }
   return true;
@@ -617,27 +718,27 @@ void stopMotors() {
   straightCmd = false;
   pwmLeft = pwmRight = 0;
   driveState = DRIVE_STOPPED;
-  turnState = TURN_NONE;
+  turnActive = false;
 }
 
 // Direct wheel speeds, negative = backwards. Used by the neural page where
 // the two sides move independently instead of the usual forward/turn calls.
-// A is the right motor and B is the left one, so the arguments go in swapped.
+// A is the left motor and B is the right one.
 void setWheels(int left, int right) {
   left = constrain(left, -255, 255);
   right = constrain(right, -255, 255);
   int l = (left >= 0) ? balancedLeft(left) : -balancedLeft(-left);
   digitalWrite(STBY, HIGH);
-  digitalWrite(AIN1, right >= 0 ? HIGH : LOW);
-  digitalWrite(AIN2, right >= 0 ? LOW : HIGH);
-  digitalWrite(BIN1, l >= 0 ? HIGH : LOW);
-  digitalWrite(BIN2, l >= 0 ? LOW : HIGH);
-  ledcWrite(pwmChannelA, abs(right));
-  ledcWrite(pwmChannelB, abs(l));
+  digitalWrite(AIN1, l >= 0 ? MOTOR_FWD1 : MOTOR_REV1);
+  digitalWrite(AIN2, l >= 0 ? MOTOR_FWD2 : MOTOR_REV2);
+  digitalWrite(BIN1, right >= 0 ? MOTOR_FWD1 : MOTOR_REV1);
+  digitalWrite(BIN2, right >= 0 ? MOTOR_FWD2 : MOTOR_REV2);
+  ledcWrite(pwmChannelA, abs(l));
+  ledcWrite(pwmChannelB, abs(right));
   pwmLeft = abs(l);
   pwmRight = abs(right);
   straightCmd = (left == right && left != 0);
-  turnState = TURN_NONE;
+  turnActive = false;
   if (left > 0 && right > 0) driveState = DRIVE_FORWARD;
   else if (left < 0 && right < 0) driveState = DRIVE_BACKWARD;
   else if (left == 0 && right == 0) driveState = DRIVE_STOPPED;
@@ -657,7 +758,8 @@ void showWelcomePage() {
 
   display.setTextSize(1);
   display.setCursor(0, 24);
-  display.println("Menu:");
+  display.print(botIP == "192.168.4.1" ? "AP " : "WiFi ");
+  display.println(botIP);
   for(uint8_t i=0; i<totalPages-1; i++) {
     display.setCursor(2 + (i / 4) * 64, 32 + (i % 4) * 8);
     display.print(i+1);
@@ -791,81 +893,326 @@ void readUltrasonic() {
   distanceFront = (duration > 0) ? (duration / 2.0) / 29.1 : -1;
 }
 
-void updateOLEDVL53(float front, uint16_t left, uint16_t right, const char* motorState) {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.printf("Front: %s\n", (front > 0) ? String(front, 1).c_str() : "Out");
-  display.printf("Left : %s\n", (left != 65535) ? String(left).c_str() : "Out");
-  display.printf("Right: %s\n", (right != 65535) ? String(right).c_str() : "Out");
-  display.printf("Motor: %s\n", motorState);
-  display.printf("Trim L: %+.1f%%", (motorBalance - 1.0f) * 100.0f);
-  display.display();
+// -------------------- Autonomous maze drive --------------------
+// The cardboard maze uses 15 cm cells with a robot that is almost as wide as
+// the corridor, plus a couple of 12 cm dead ends. There is no room to spin
+// inside a cell, so this mode drives straight with a gyro heading hold and
+// only spins in a side room (the 24/41/55 cm spaces) where the chassis can
+// sweep. When the front is blocked and both sides are corridor-tight, it
+// reverses to the last room instead of pivoting into a wall.
+enum AutoState { AUTO_WAIT, AUTO_CRUISE, AUTO_TURN, AUTO_BACK, AUTO_HALT };
+
+AutoState autoState = AUTO_WAIT;
+unsigned long autoStateStart = 0;
+unsigned long autoCruiseStart = 0; // when the current straight run began
+unsigned long autoRoomSeenAt = 0;
+float autoHeading = 0;         // heading to hold while cruising
+bool autoTurnCcw = true;
+bool autoBackSawRoom = false;
+bool autoSawFront = false;
+unsigned long autoNoFrontSince = 0;
+unsigned long autoStuckSince = 0;
+unsigned long autoTurnWindowStart = 0;
+int autoTurnCount = 0;
+
+const int AUTO_SPEED = 125;        // forward PWM, above the motors' dead zone
+const int AUTO_BACK_SPEED = 110;
+const int AUTO_TURN_SPEED = 90;
+const float AUTO_FRONT_STOP_CM = 9.0f;
+const float AUTO_FRONT_PANIC_CM = 5.5f;
+const float AUTO_TURN_CLEAR_CM = 4.0f; // below this after a spin = real collision
+const int AUTO_SIDE_ROOM_MM = 55;  // clearance that means a real side room
+const unsigned long AUTO_BACK_MAX_MS = 3200;
+const unsigned long AUTO_WAIT_MS = 900;
+const unsigned long AUTO_BACK_ROOM_SETTLE_MS = 900;
+const unsigned long AUTO_SOFT_START_MS = 300;
+
+// Flip if a hand test shows the left reading move when the right wall is
+// touched. The maze code is only safe when this matches the wiring.
+const int AUTO_SIDE_SIGN = 1;
+
+float wrap180(float a) {
+  while (a > 180) a -= 360;
+  while (a < -180) a += 360;
+  return a;
+}
+
+const char* autoStateName() {
+  switch (autoState) {
+    case AUTO_WAIT: return "wait";
+    case AUTO_CRUISE: return "fwd";
+    case AUTO_TURN: return autoTurnCcw ? "turn L" : "turn R";
+    case AUTO_BACK: return "back";
+    case AUTO_HALT: return "halt";
+  }
+  return "?";
+}
+
+void autoReset() {
+  stopMotors();
+  autoState = AUTO_WAIT;
+  autoStateStart = millis();
+  autoRoomSeenAt = 0;
+  autoBackSawRoom = false;
+  autoSawFront = false;
+  autoHeading = pose.heading;
+  autoCruiseStart = millis();
+  frontObstacleStreak = 0;
+  autoNoFrontSince = 0;
+  autoStuckSince = 0;
+  autoTurnCount = 0;
+  autoTurnWindowStart = millis();
+}
+
+void startStraightTest(int pwm) {
+  stopMotors();
+  straightTestPwm = constrain(pwm, 60, 160);
+  currentPage = 0;
+  straightTestActive = true;
+  straightTestStart = millis();
+  straightTestHeading = pose.heading;
+  moveForward(straightTestPwm, straightTestPwm);
+  straightCmd = false; // keep the trim learner out of the measurement
+  Serial.printf("STRAIGHT start pwm=%d H=%.1f\n", straightTestPwm, straightTestHeading);
+}
+
+void straightTestUpdate() {
+  if (!straightTestActive) return;
+  if (millis() - straightTestStart < 2000) return;
+  stopMotors();
+  straightTestActive = false;
+  readUltrasonic();
+  Serial.printf("STRAIGHT end dh=%.1f F=%.1f BAL=%.3f\n",
+                wrap180(pose.heading - straightTestHeading), distanceFront, motorBalance);
+}
+
+void startAutoTurn(bool ccw) {
+  unsigned long now = millis();
+  if (now - autoTurnWindowStart > 7000) {
+    autoTurnWindowStart = now;
+    autoTurnCount = 0;
+  }
+  autoTurnCount++;
+  if (autoTurnCount > 3) {
+    stopMotors();
+    autoState = AUTO_HALT;
+    beep(3);
+    Serial.println("AUTO halt: turn loop");
+    return;
+  }
+  stopMotors();
+  autoTurnCcw = ccw;
+  startTurn(ccw, AUTO_TURN_SPEED, 88.0f); // brake/coast finishes the last couple of degrees
+  autoState = AUTO_TURN;
+  autoStateStart = millis();
+}
+
+void showAutoStatus() {
+  static unsigned long lastDraw = 0, lastLog = 0;
+  unsigned long now = millis();
+  if (now - lastDraw > 150) {
+    lastDraw = now;
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.printf("AUTO %s\n", autoStateName());
+    display.print("F ");
+    if (distanceFront > 0) display.printf("%.0fcm\n", distanceFront);
+    else display.println("out");
+    display.print("L ");
+    if (distLeft == 65535) display.print("out"); else display.printf("%dmm", distLeft);
+    display.print("  R ");
+    if (distRight == 65535) display.print("out"); else display.printf("%dmm", distRight);
+    display.println();
+    display.printf("Hdg %+.0f", pose.heading);
+    display.display();
+  }
+  if (now - lastLog > 300) {
+    lastLog = now;
+    Serial.printf("AUTO %s F=%.1f L=%u R=%u H=%.1f st=%d\n",
+                  autoStateName(), distanceFront, distLeft, distRight,
+                  pose.heading, (int)autoState);
+  }
 }
 
 void ultrasonicHybridDrive() {
-  // If mid-turn, let it finish before reading sensors / making a new decision.
-  // This is the fix for the "lag then sudden turn then stop" behavior — the
-  // old code used delay(190) inside turnRight/turnLeft which froze everything
-  // (sensors, OLED, buttons) for the full turn duration.
-  if (turnUpdate()) {
+  // A spin is gyro-owned: don't make new decisions until it finishes.
+  if (autoState == AUTO_TURN) {
+    if (turnUpdate()) {
+      showAutoStatus();
+      return;
+    }
+    if (turnFault) {
+      stopMotors();
+      autoState = AUTO_HALT;
+      beep(2);
+      Serial.println("AUTO halt: turn polarity fault");
+      showAutoStatus();
+      return;
+    }
+    // Re-read the front before trusting the new direction. A corridor wall
+    // 7.5 cm from a freshly turned nose is normal, so only treat it as a
+    // collision when it is closer than the chassis can recover from.
+    readUltrasonic();
+    if (distanceFront > 0 && distanceFront < AUTO_TURN_CLEAR_CM) {
+      stopMotors();
+      autoState = AUTO_BACK;
+      autoStateStart = millis();
+      autoBackSawRoom = false;
+      autoRoomSeenAt = 0;
+      Serial.println("AUTO turn hit wall");
+    } else {
+      autoHeading = wrap180(autoHeading + (autoTurnCcw ? 90.0f : -90.0f));
+      autoCruiseStart = millis();
+      autoState = AUTO_CRUISE;
+    }
+    showAutoStatus();
     return;
   }
 
   distLeft = sensorLeft.readRangeContinuousMillimeters();
   distRight = sensorRight.readRangeContinuousMillimeters();
-  if(sensorLeft.timeoutOccurred()) distLeft = 65535;
-  if(sensorRight.timeoutOccurred()) distRight = 65535;
-
+  if (sensorLeft.timeoutOccurred()) distLeft = 65535;
+  if (sensorRight.timeoutOccurred()) distRight = 65535;
   readUltrasonic();
 
-  bool rawFront = (distanceFront > 0 && distanceFront < 15);
-  bool rawLeft  = (distLeft != 65535 && distLeft < 150);
-  bool rawRight = (distRight != 65535 && distRight < 150);
+  bool frontKnown = (distanceFront > 0);
+  bool frontClose = (frontKnown && distanceFront < AUTO_FRONT_STOP_CM);
+  bool leftRoom  = (distLeft  != 65535 && distLeft  > AUTO_SIDE_ROOM_MM);
+  bool rightRoom = (distRight != 65535 && distRight > AUTO_SIDE_ROOM_MM);
 
-  frontObstacleStreak = rawFront ? frontObstacleStreak + 1 : 0;
-  leftObstacleStreak  = rawLeft  ? leftObstacleStreak + 1  : 0;
-  rightObstacleStreak = rawRight ? rightObstacleStreak + 1 : 0;
-
-  bool obstacleFront = (frontObstacleStreak >= OBSTACLE_CONFIRM_COUNT);
-  bool obstacleLeft  = (leftObstacleStreak  >= OBSTACLE_CONFIRM_COUNT);
-  bool obstacleRight = (rightObstacleStreak >= OBSTACLE_CONFIRM_COUNT);
-
-  const int forwardSpeed = 150;
-  const int turnSpeed = 60;
-  const int backwardSpeed = 150;
-  const char* motorState;
-
-  if(obstacleFront && obstacleLeft && obstacleRight) {
-    motorState = "Backward";
-    moveBackward(backwardSpeed, backwardSpeed);
-  } else if(obstacleLeft && !obstacleRight) {
-    motorState = "Turn Right";
-    turnRightStart(turnSpeed, turnSpeed);
-  } else if(obstacleRight && !obstacleLeft) {
-    motorState = "Turn Left";
-    turnLeftStart(turnSpeed, turnSpeed);
-  } else if(obstacleFront) {
-    if(!obstacleLeft) {
-      motorState = "Turn Left (free)";
-      turnLeftStart(turnSpeed, turnSpeed);
-    } else if(!obstacleRight) {
-      motorState = "Turn Right (free)";
-      turnRightStart(turnSpeed, turnSpeed);
+  // A dead or unplugged HC-SR04 would otherwise look like "wide open" and the
+  // robot would drive into the first wall it met. The maze is never 1.7 m
+  // clear in a straight line, so a long run of no echo is a fault.
+  if (autoState == AUTO_CRUISE || autoState == AUTO_BACK) {
+    if (!frontKnown) {
+      if (autoNoFrontSince == 0) autoNoFrontSince = millis();
+      if (millis() - autoNoFrontSince > 700) {
+        stopMotors();
+        autoState = AUTO_HALT;
+        beep(2);
+        Serial.println("AUTO halt: front sensor dead");
+        showAutoStatus();
+        return;
+      }
     } else {
-      motorState = "Stop";
-      stopMotors();
+      autoNoFrontSince = 0;
     }
   } else {
-    motorState = "Forward";
-    moveForward(forwardSpeed, forwardSpeed);
+    autoNoFrontSince = 0;
   }
 
-  updateOLEDVL53(distanceFront, distLeft, distRight, motorState);
+  switch (autoState) {
+    case AUTO_WAIT:
+      stopMotors();
+      if (frontKnown) autoSawFront = true;
+      if (millis() - autoStateStart >= AUTO_WAIT_MS) {
+        if (!autoSawFront) {
+          autoState = AUTO_HALT;
+          beep(2);
+          Serial.println("AUTO halt: front sensor dead at start");
+          break;
+        }
+        autoHeading = pose.heading;
+        autoCruiseStart = millis();
+        autoState = AUTO_CRUISE;
+      }
+      break;
 
-  Serial.printf("Front: %.1f cm (streak %d), Left: %d mm (streak %d), Right: %d mm (streak %d), Action: %s\n",
-                distanceFront, frontObstacleStreak, distLeft, leftObstacleStreak,
-                distRight, rightObstacleStreak, motorState);
+    case AUTO_CRUISE: {
+      if (frontClose) {
+        frontObstacleStreak++;
+      } else {
+        frontObstacleStreak = 0;
+      }
+
+      if (frontObstacleStreak >= 2 || (frontKnown && distanceFront < AUTO_FRONT_PANIC_CM)) {
+        stopMotors();
+        // The nose is already close to the wall, so a 90 degree sweep from
+        // here drags a front corner through it even when a side room is
+        // visible. Always back first; AUTO_BACK picks the room side and spins
+        // only after the chassis centre is clear of the corridor mouth.
+        autoState = AUTO_BACK;
+        autoStateStart = millis();
+        autoBackSawRoom = false;
+        autoRoomSeenAt = 0;
+        break;
+      }
+
+      // Gyro heading hold + gentle side centring. Both are small so a noisy
+      // ToF sample cannot yank the wheel hard in a 15 cm corridor.
+      float err = wrap180(autoHeading - pose.heading);
+      int steer = constrain((int)(err * 1.4f), -22, 22);
+      if (distLeft != 65535 && distRight != 65535 &&
+          distLeft >= 15 && distRight >= 15 &&
+          distLeft <= 250 && distRight <= 250 &&
+          abs((int)distLeft - (int)distRight) < 80) {
+        int centring = (int)(((int)distLeft - (int)distRight) * 0.12f) * AUTO_SIDE_SIGN;
+        steer += constrain(centring, -10, 10);
+      }
+      steer = constrain(steer, -26, 26);
+      // If the nose is badly off-heading and the gyro sees no rotation, the
+      // chassis is wedged on a wall. Stop instead of grinding along it.
+      if (fabsf(err) > 35.0f && fabsf(gyroYawRate) < 2.0f) {
+        if (autoStuckSince == 0) autoStuckSince = millis();
+        if (millis() - autoStuckSince > 1200) {
+          stopMotors();
+          autoState = AUTO_HALT;
+          beep(3);
+          Serial.println("AUTO halt: wedged");
+          break;
+        }
+      } else {
+        autoStuckSince = 0;
+      }
+      // Short soft start: the first PWM step is what breaks traction and
+      // starts the old sideways lurch. Ramp 90 -> 125 over 300 ms.
+      int base = AUTO_SPEED;
+      unsigned long runFor = millis() - autoCruiseStart;
+      if (runFor < AUTO_SOFT_START_MS) {
+        base = 90 + (AUTO_SPEED - 90) * (int)runFor / (int)AUTO_SOFT_START_MS;
+      }
+      int l = constrain(base - steer, 50, 150);
+      int r = constrain(base + steer, 50, 150);
+      moveForward(l, r);
+      break;
+    }
+
+    case AUTO_BACK: {
+      moveBackward(AUTO_BACK_SPEED, AUTO_BACK_SPEED);
+      unsigned long elapsed = millis() - autoStateStart;
+
+      if (!autoBackSawRoom && elapsed > 150 && (leftRoom || rightRoom)) {
+        autoBackSawRoom = true;
+        autoRoomSeenAt = millis();
+      }
+      // Keep backing a little after the rear pod sees the room so the centre
+      // of the chassis clears the corridor before the spin.
+      if (autoBackSawRoom && millis() - autoRoomSeenAt >= AUTO_BACK_ROOM_SETTLE_MS) {
+        stopMotors();
+        bool goLeft = leftRoom && (!rightRoom || distLeft >= distRight);
+        if (goLeft || rightRoom) startAutoTurn(goLeft);
+        else { autoState = AUTO_HALT; beep(2); }
+        break;
+      }
+
+      if (elapsed >= AUTO_BACK_MAX_MS) {
+        stopMotors();
+        autoState = AUTO_HALT;
+        beep(2);
+        Serial.println("AUTO halt: no room behind");
+      }
+      break;
+    }
+
+    case AUTO_HALT:
+    default:
+      stopMotors();
+      break;
+  }
+
+  showAutoStatus();
 }
 
 // -------------------- Neural drive --------------------
@@ -948,9 +1295,17 @@ void calibrateGyroBias() {
 void loadMotorBalance() {
   prefs.begin("maze", false);
   motorBalance = prefs.isKey("balance") ? prefs.getFloat("balance", 1.0f) : 1.0f;
+  driveInvert = prefs.isKey("invert") ? prefs.getBool("invert", false) : true;
   prefs.end();
   motorBalance = constrain(motorBalance, 0.75f, 1.25f);
   Serial.printf("motor balance: %.3f\n", motorBalance);
+  Serial.printf("drive invert: %s\n", driveInvert ? "on" : "off");
+}
+
+void saveDriveInvert() {
+  prefs.begin("maze", false);
+  prefs.putBool("invert", driveInvert);
+  prefs.end();
 }
 
 void saveMotorBalance() {
@@ -1099,25 +1454,77 @@ void predictPosition(float secondsAhead, float &predX, float &predY) {
   predY = pose.y + speed * secondsAhead * sin(headingRad);
 }
 
-// -------------------- WiFi (STA first, own AP as fallback) --------------------
+// -------------------- WiFi (STA + fallback AP, mDNS, OTA) --------------------
+// Connecting happens in the background. setupWifi() never blocks: the web
+// server is live on the fallback AP immediately, and the robot retries the
+// phone hotspot every 20 s until it joins.
 void setupWifi() {
-  botIP = "no wifi";
-  String ssid = WIFI_SSID;
-  if (ssid.length() && ssid != "YOUR_WIFI_NAME") {
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.printf("wifi: joining '%s'...\n", WIFI_SSID);
-    unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) delay(500);
+  prefs.begin("maze", false);
+  wifiSsid = prefs.isKey("ssid") ? prefs.getString("ssid", WIFI_SSID) : String(WIFI_SSID);
+  wifiPass = prefs.isKey("pass") ? prefs.getString("pass", WIFI_PASS) : String(WIFI_PASS);
+  prefs.end();
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  apIP = WiFi.softAPIP().toString();
+  botIP = apIP;
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  Serial.printf("AP '%s' ip %s\n", AP_SSID, apIP.c_str());
+
+  // OTA and mDNS also work on the fallback AP, so the board can be updated
+  // and controlled even when the phone hotspot is unavailable.
+  if (MDNS.begin("mazerunner")) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("mdns: http://mazerunner.local");
   }
-  if (WiFi.status() == WL_CONNECTED) {
-    botIP = WiFi.localIP().toString();
-    Serial.printf("wifi ok: %s\n", botIP.c_str());
+  ArduinoOTA.setHostname("mazerunner");
+  ArduinoOTA.setPassword(OTA_PASS);
+  ArduinoOTA.onStart([]() { stopMotors(); Serial.println("OTA start"); });
+  ArduinoOTA.onEnd([]() { Serial.println("OTA end"); });
+  ArduinoOTA.onError([](ota_error_t e) { Serial.printf("OTA error %u\n", (unsigned)e); });
+  ArduinoOTA.begin();
+  otaReady = true;
+  Serial.println("ota ready (AP or STA)");
+
+  if (wifiSsid.length() && wifiSsid != "YOUR_WIFI_NAME") {
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    Serial.printf("wifi: joining '%s'...\n", wifiSsid.c_str());
+    wifiRetryAt = millis() + 20000;
+  }
+}
+
+void wifiLoop() {
+  static int lastStatus = -1;
+  int st = (int)WiFi.status();
+  if (st != lastStatus) {
+    lastStatus = st;
+    Serial.printf("wifi status %d\n", st);
+  }
+
+  if (st == WL_CONNECTED) {
+    String ip = WiFi.localIP().toString();
+    if (ip != botIP) {
+      botIP = ip;
+      Serial.printf("wifi ok: %s rssi %d\n", botIP.c_str(), WiFi.RSSI());
+    }
+    if (!netServicesStarted) {
+      netServicesStarted = true;
+      MDNS.begin("mazerunner");
+      MDNS.addService("http", "tcp", 80);
+      Serial.println("mdns refreshed for STA");
+    }
   } else {
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASS);
-    botIP = WiFi.softAPIP().toString();
-    Serial.printf("AP up: '%s' ip %s\n", AP_SSID, botIP.c_str());
+    if (netServicesStarted) {
+      netServicesStarted = false;
+      botIP = apIP;
+      Serial.println("wifi lost, AP fallback");
+    }
+    if (wifiSsid.length() && millis() >= wifiRetryAt) {
+      wifiRetryAt = millis() + 20000;
+      Serial.printf("wifi retry '%s' (status %d)\n", wifiSsid.c_str(), st);
+      WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    }
   }
 }
 
@@ -1288,11 +1695,9 @@ void laptopDrive() {
     moveBackward(speed, speed);
     delay(500);
   } else if (action == "left") {
-    turnLeftStart(speed, speed);
-    delay(260);
+    spinCCW(speed, 400);
   } else if (action == "right") {
-    turnRightStart(speed, speed);
-    delay(260);
+    spinCW(speed, 400);
   }
   stopMotors();
 
@@ -1312,35 +1717,223 @@ String escHtml(const String& s) {
   return o;
 }
 
+static const char HTML_PAGE[] PROGMEM = R"HTML(<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>MazeRunner</title>
+<style>
+:root{--bg:#0b0f14;--card:#151c24;--line:#27313d;--fg:#e7edf3;--dim:#8fa0b3;--accent:#4cc2ff;--go:#2ecc71;--stop:#ff5252}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0 auto;max-width:760px;padding:16px;background:var(--bg);color:var(--fg);font-family:system-ui,"Segoe UI",Roboto,sans-serif}
+h1{font-size:20px;letter-spacing:.22em;margin:0 0 4px}
+#status{font-size:12px;color:var(--dim);margin-bottom:14px}
+#dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#ff5252;margin-right:6px}
+#dot.on{background:var(--go);box-shadow:0 0 8px var(--go)}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px}
+.k{color:var(--dim);font-size:11px;letter-spacing:.12em}
+.v{font-size:26px;font-variant-numeric:tabular-nums;margin-top:2px}
+.u{font-size:12px;color:var(--dim)}
+.wide{margin-top:10px}
+.pad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:14px 0}
+button{border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:12px;padding:16px;font-size:18px;font-weight:600;touch-action:none;user-select:none;cursor:pointer}
+button:active,button.held{background:#203040;border-color:var(--accent)}
+button.stop{background:#2a1517;border-color:#7a2a2e;color:#ff8b8b}
+button.auto{background:#10251a;border-color:#245c3a;color:#7ef0ad}
+button.auto.stop{background:#2a1517;border-color:#7a2a2e;color:#ff8b8b}
+.row{display:flex;gap:8px;margin-top:10px}
+.row button{flex:1;padding:13px;font-size:14px}
+.foot{color:var(--dim);font-size:11px;margin-top:16px;line-height:1.5}
+input{width:100%;margin:5px 0;padding:11px;border-radius:9px;border:1px solid var(--line);background:#0f151c;color:var(--fg);font-size:15px}
+code{color:var(--accent)}
+</style></head><body>
+<h1>MAZERUNNER</h1>
+<div id="status"><span id="dot"></span><span id="link">connecting...</span></div>
+
+<div class="grid">
+  <div class="tile"><div class="k">FRONT</div><div><span class="v" id="front">--</span><span class="u"> cm</span></div></div>
+  <div class="tile"><div class="k">LEFT</div><div><span class="v" id="left">--</span><span class="u"> mm</span></div></div>
+  <div class="tile"><div class="k">RIGHT</div><div><span class="v" id="right">--</span><span class="u"> mm</span></div></div>
+  <div class="tile"><div class="k">HEADING</div><div><span class="v" id="heading">--</span><span class="u"> deg</span></div></div>
+</div>
+
+<div class="tile wide"><div class="k">MODE</div><div class="v" id="mode" style="font-size:18px">manual</div>
+<div class="u" id="meta">trim --</div></div>
+
+<div class="pad">
+  <div></div><button id="f">&#9650;</button><div></div>
+  <button id="l">&#9664;</button><button id="s" class="stop">STOP</button><button id="r">&#9654;</button>
+  <div></div><button id="b">&#9660;</button><div></div>
+</div>
+
+<div class="row">
+  <button id="auto" class="auto">AUTO START</button>
+  <button id="autostop" class="auto stop">AUTO STOP</button>
+</div>
+<div class="row">
+  <button id="tm">TRIM -</button>
+  <button id="tp">TRIM +</button>
+  <button id="tr">TRIM RESET</button>
+</div>
+<div class="row">
+  <button id="inv">SWAP F/B</button>
+</div>
+
+<div class="tile wide"><div class="k">WIFI</div>
+<div class="u" id="wifi">not connected</div>
+<form action="/wifi" method="post" style="margin-top:8px">
+  <input name="ssid" placeholder="network name (SSID)" autocomplete="off" autocapitalize="none" spellcheck="false">
+  <input name="pass" type="password" placeholder="password" autocomplete="off">
+  <button type="submit" class="auto" style="width:100%">SAVE &amp; CONNECT</button>
+</form>
+<div class="u" style="margin-top:8px">The robot joins this network in the background and stays on the fallback AP until it succeeds.</div>
+</div>
+
+<div class="foot">
+Hold a direction button to drive, release to stop. The robot also stops by itself
+if the page goes offline for 8 s.<br>
+AP fallback: join <code>MazeRunner</code> / <code>mazerunner123</code>, then open
+<code>http://192.168.4.1</code>.
+</div>
+
+<script>
+const q=id=>document.getElementById(id);
+let held=null, keep=null;
+const send=(p)=>fetch(p,{cache:'no-store'}).catch(()=>{});
+function stopAll(){held=null;clearInterval(keep);send('/drive?dir=S');}
+function bindHold(id,dir){
+  const b=q(id);
+  const down=e=>{e.preventDefault();held=dir;b.classList.add('held');send('/drive?dir='+dir);
+    clearInterval(keep);keep=setInterval(()=>{if(held===dir)send('/drive?dir='+dir);},1500);};
+  const up=e=>{e.preventDefault();if(held===dir)stopAll();b.classList.remove('held');};
+  b.addEventListener('pointerdown',down);
+  b.addEventListener('pointerup',up);
+  b.addEventListener('pointerleave',up);
+  b.addEventListener('pointercancel',up);
+  b.addEventListener('contextmenu',e=>e.preventDefault());
+}
+bindHold('f','F');bindHold('b','B');bindHold('l','L');bindHold('r','R');
+q('s').addEventListener('pointerdown',e=>{e.preventDefault();stopAll();});
+q('auto').addEventListener('pointerdown',e=>{e.preventDefault();stopAll();send('/auto?on=1');});
+q('autostop').addEventListener('pointerdown',e=>{e.preventDefault();stopAll();send('/auto?on=0');});
+q('tm').onclick=()=>send('/trim?step=-2');
+q('tp').onclick=()=>send('/trim?step=2');
+q('tr').onclick=()=>send('/trim?reset=1');
+q('inv').onclick=()=>send('/invert');
+window.addEventListener('blur',stopAll);
+window.addEventListener('pagehide',()=>{navigator.sendBeacon('/drive?dir=S');});
+async function poll(){
+  try{
+    const r=await fetch('/sensors',{cache:'no-store'});
+    const j=await r.json();
+    q('dot').classList.add('on');
+    q('link').textContent='online  '+j.ip+'  '+j.rssi+' dBm';
+    q('front').textContent=j.front>0?Math.round(j.front):'out';
+    q('left').textContent=j.left===65535?'out':j.left;
+    q('right').textContent=j.right===65535?'out':j.right;
+    q('heading').textContent=(j.heading>=0?'+':'')+Math.round(j.heading);
+    q('mode').textContent=j.auto?'AUTO '+j.state:'manual';
+    q('meta').textContent='trim '+j.trim.toFixed(1)+'%   speed '+j.speed+'   '+j.ip;
+    q('inv').textContent='SWAP F/B  ('+(j.inv?'swapped':'normal')+')';
+    q('wifi').textContent='network: '+j.ssid+'   address: '+j.ip;
+  }catch(e){
+    q('dot').classList.remove('on');
+    q('link').textContent='offline - robot not reachable';
+  }
+}
+setInterval(poll,300);poll();
+</script>
+</body></html>)HTML";
+
 void handleWebRoot() {
-  String h = "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  h += "<style>body{font-family:sans-serif;text-align:center}td{padding:6px}a.btn{display:block;padding:14px 22px;background:#222;color:#fff;text-decoration:none;border-radius:8px;font-size:20px}</style></head><body>";
-  h += "<h2>MazeRunner</h2>";
-  h += "<table align='center'><tr><td></td><td><a class='btn' href='/cmd?dir=F'>F</a></td><td></td></tr>";
-  h += "<tr><td><a class='btn' href='/cmd?dir=L'>L</a></td><td><a class='btn' href='/cmd?dir=S'>STOP</a></td><td><a class='btn' href='/cmd?dir=R'>R</a></td></tr>";
-  h += "<tr><td></td><td><a class='btn' href='/cmd?dir=B'>B</a></td><td></td></tr></table>";
-  h += "<form action='/speed'>Speed <input type='range' name='v' min='0' max='255' value='" + String(webSpeed) + "'>";
-  h += "<input type='submit' value='Set'></form>";
-  h += "<p>Laptop: <b>" + escHtml(laptopHost.length() ? laptopHost : "not set") + "</b></p>";
-  h += "<form action='/ask'>Ask laptop: <input name='q' size='18'> <input type='submit' value='Ask'></form>";
-  h += "<p>Laptop says: <b>" + escHtml(lastAIAnswer) + "</b></p>";
-  h += "<form action='/target'>Laptop IP <input name='host' value='" + escHtml(laptopHost) + "'> <input type='submit' value='Save'></form>";
-  String trimPct = String((motorBalance - 1.0f) * 100.0f, 1);
-  h += "<p>Trim L: <b>" + trimPct + "%</b> <a href='/trim?cal=1' onclick=\"return confirm('1.2m clear ahead?')\">calibrate</a> | <a href='/trim?reset=1'>reset</a></p>";
-  h += "<form action='/trim'>L <input name='b' size='4' value='" + trimPct + "'>% <input type='submit' value='Set'></form>";
-  h += "<p>Sensors: <span id='s'>...</span></p>";
-  h += "<p>Last voice: <b>" + escHtml(lastVoiceText) + "</b></p>";
-  h += "<script>setInterval(async()=>{try{const r=await fetch('/sensors');const j=await r.json();document.getElementById('s').textContent=j.front+'cm / '+j.left+'mm / '+j.right+'mm / trim '+j.trim+'%';}catch(e){}},1000);</script>";
-  h += "</body></html>";
-  webServer.send(200, "text/html", h);
+  webServer.send_P(200, "text/html", HTML_PAGE);
 }
 
 void webBurst(const String& dir) {
   if (dir == "F") { moveForward(webSpeed, webSpeed); delay(600); }
   else if (dir == "B") { moveBackward(webSpeed, webSpeed); delay(600); }
-  else if (dir == "L") { turnLeftStart(webSpeed, webSpeed); delay(250); }
-  else if (dir == "R") { turnRightStart(webSpeed, webSpeed); delay(250); }
+  else if (dir == "L") { spinCCW(webSpeed, 400); }
+  else if (dir == "R") { spinCW(webSpeed, 400); }
   stopMotors();
+}
+
+// Hold-to-drive: the page sends a direction on pointer-down and S on
+// pointer-up. Applying it every loop keeps the motors moving without any
+// blocking delay in the web handler. An 8 s watchdog stops a lost connection.
+void webDriveApply() {
+  if (webHoldDir == 'S') return;
+  if (millis() - webHoldLast > 8000) {
+    webHoldDir = 'S';
+    stopMotors();
+    return;
+  }
+  switch (webHoldDir) {
+    case 'F': moveForward(webSpeed, webSpeed); break;
+    case 'B': moveBackward(webSpeed, webSpeed); break;
+    case 'L': { int s = min(webSpeed, 120); setWheels(-s, s); break; }
+    case 'R': { int s = min(webSpeed, 120); setWheels(s, -s); break; }
+    default: webHoldDir = 'S'; stopMotors(); break;
+  }
+}
+
+void handleWebDrive() {
+  String d = webServer.arg("dir");
+  if (!d.length()) d = "S";
+  char c = toupper(d[0]);
+  if (c == 'S') {
+    webHoldDir = 'S';
+    stopMotors();
+  } else if (c == 'F' || c == 'B' || c == 'L' || c == 'R') {
+    webHoldDir = c;
+    webHoldLast = millis();
+    if (currentPage == 3) autoState = AUTO_HALT;
+    currentPage = 0;
+    webDriveApply();
+  }
+  webServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleWebAuto() {
+  bool on = webServer.arg("on") == "1";
+  webHoldDir = 'S';
+  stopMotors();
+  if (on) {
+    currentPage = 3;
+    autoReset();
+  } else {
+    autoState = AUTO_HALT;
+    currentPage = 0;
+    showWelcomePage();
+  }
+  webServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleWebInvert() {
+  if (webServer.hasArg("on")) driveInvert = webServer.arg("on") == "1";
+  else driveInvert = !driveInvert;
+  saveDriveInvert();
+  Serial.printf("drive invert: %s\n", driveInvert ? "on" : "off");
+  webServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleWebWifi() {
+  String s = webServer.arg("ssid");
+  s.trim();
+  String p = webServer.arg("pass");
+  if (s.length()) {
+    wifiSsid = s;
+    wifiPass = p;
+    prefs.begin("maze", false);
+    prefs.putString("ssid", wifiSsid);
+    prefs.putString("pass", wifiPass);
+    prefs.end();
+    WiFi.disconnect();
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    wifiRetryAt = millis() + 20000;
+    Serial.printf("wifi config: '%s'\n", wifiSsid.c_str());
+  }
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
 }
 
 void handleWebCmd() {
@@ -1360,6 +1953,10 @@ void handleWebTrim() {
     calibrateMotorBalance();
   } else if (webServer.hasArg("reset")) {
     motorBalance = 1.0f;
+    saveMotorBalance();
+  } else if (webServer.hasArg("step")) {
+    float pct = (motorBalance - 1.0f) * 100.0f + webServer.arg("step").toFloat();
+    motorBalance = constrain(1.0f + pct / 100.0f, 0.75f, 1.25f);
     saveMotorBalance();
   } else if (webServer.hasArg("b")) {
     float pct = webServer.arg("b").toFloat();
@@ -1414,13 +2011,26 @@ void handleWebSensors() {
   if (sensorRight.timeoutOccurred()) r = 65535;
   readUltrasonic();
   String j = "{\"front\":" + String(distanceFront, 1) + ",\"left\":" + String(l) +
-             ",\"right\":" + String(r) + ",\"trim\":" + String((motorBalance - 1.0f) * 100.0f, 2) + "}";
+             ",\"right\":" + String(r) +
+             ",\"heading\":" + String(pose.heading, 1) +
+             ",\"trim\":" + String((motorBalance - 1.0f) * 100.0f, 2) +
+             ",\"speed\":" + String(webSpeed) +
+             ",\"auto\":" + String(currentPage == 3 ? "true" : "false") +
+             ",\"state\":\"" + autoStateName() + "\"" +
+             ",\"inv\":" + String(driveInvert ? "true" : "false") +
+             ",\"ssid\":\"" + wifiSsid + "\"" +
+             ",\"ip\":\"" + botIP + "\"" +
+             ",\"rssi\":" + String(WiFi.RSSI()) + "}";
   webServer.send(200, "application/json", j);
 }
 
 void setupWeb() {
   webServer.on("/", handleWebRoot);
   webServer.on("/cmd", handleWebCmd);
+  webServer.on("/drive", handleWebDrive);
+  webServer.on("/auto", handleWebAuto);
+  webServer.on("/invert", handleWebInvert);
+  webServer.on("/wifi", handleWebWifi);
   webServer.on("/speed", handleWebSpeed);
   webServer.on("/trim", handleWebTrim);
   webServer.on("/sensors", handleWebSensors);
@@ -1682,8 +2292,116 @@ void voiceSendWifi() {
 }
 
 // PC answers "TXTHDR" + uint32le len + utf8 ("YOU: ...\nAI: ..."). Runs every loop.
+// Tiny USB console for bench testing. Send !P for one sensor sample, !A to
+// start the autonomous page, !X to stop, !C to re-zero the gyro, !0 to reset
+// the wheel trim, !T<percent> to set it (e.g. !T109 = 1.09), !S for a 2 s
+// straight-line test at fixed PWM, and !L/!R/!F/!B for short movement bursts.
+// The robot still has to be on a clear patch.
+void handleSerialCmd(char c) {
+  switch (c) {
+    case 'P': case 'p': {
+      uint16_t l = sensorLeft.readRangeContinuousMillimeters();
+      bool lt = sensorLeft.timeoutOccurred();
+      uint16_t r = sensorRight.readRangeContinuousMillimeters();
+      bool rt = sensorRight.timeoutOccurred();
+      readUltrasonic();
+      Serial.printf("SENS F=%.1fcm L=%u%s R=%u%s H=%.1f BAL=%.3f INV=%d PAGE=%u\n",
+                    distanceFront, l, lt ? "!" : "", r, rt ? "!" : "",
+                    pose.heading, motorBalance, driveInvert ? 1 : 0, currentPage);
+      break;
+    }
+    case 'A': case 'a':
+      stopMotors();
+      currentPage = 3;
+      autoReset();
+      Serial.println("AUTO start");
+      break;
+    case 'X': case 'x':
+      stopMotors();
+      currentPage = 0;
+      showWelcomePage();
+      Serial.println("stop");
+      break;
+    case 'C': case 'c':
+      stopMotors();
+      calibrateGyroBias();
+      Serial.println("gyro calibrated");
+      break;
+    case '0':
+      motorBalance = 1.0f;
+      saveMotorBalance();
+      Serial.println("trim reset: 1.000");
+      break;
+    case 'S': case 's':
+      startStraightTest(130);
+      break;
+    case 'I': case 'i':
+      driveInvert = !driveInvert;
+      saveDriveInvert();
+      Serial.printf("drive invert: %s\n", driveInvert ? "on" : "off");
+      break;
+    case 'W': case 'w': {
+      wifiRetryAt = millis() + 60000;
+      Serial.println("wifi scan: STA-only");
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_STA);
+      delay(400);
+      Serial.printf("scan mode %d status %d\n", (int)WiFi.getMode(), (int)WiFi.status());
+      int n = WiFi.scanNetworks(false, true);
+      Serial.printf("scan found %d\n", n);
+      for (int i = 0; i < n && i < 20; i++) {
+        Serial.printf("  %d: '%s' rssi %d ch %d auth %d\n", i,
+                      WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i),
+                      (int)WiFi.encryptionType(i));
+      }
+      WiFi.scanDelete();
+      WiFi.mode(WIFI_AP_STA);
+      WiFi.softAP(AP_SSID, AP_PASS);
+      WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+      wifiRetryAt = millis() + 20000;
+      break;
+    }
+    case 'L': case 'l':
+      stopMotors();
+      spinCCW(110, 300);
+      Serial.printf("TEST CCW H=%.1f\n", pose.heading);
+      break;
+    case 'R': case 'r':
+      stopMotors();
+      spinCW(110, 300);
+      Serial.printf("TEST CW H=%.1f\n", pose.heading);
+      break;
+    case 'F': case 'f':
+      moveForward(130, 130);
+      delay(500);
+      brakeMotors(30);
+      Serial.println("TEST FWD");
+      break;
+    case 'B': case 'b':
+      moveBackward(130, 130);
+      delay(500);
+      brakeMotors(30);
+      Serial.println("TEST BACK");
+      break;
+    default:
+      break;
+  }
+}
+
+// Manual wheel trim from the serial console. The gyro learner needs a long
+// straight run and auto steers every cycle, so bench tuning sets it by hand.
+void setTrimPercent(int pct) {
+  pct = constrain(pct, 50, 150);
+  motorBalance = pct / 100.0f;
+  saveMotorBalance();
+  Serial.printf("trim set: %.3f\n", motorBalance);
+}
+
 void pollSerialReply() {
   static uint8_t stage = 0; // 0 = magic, 1 = len, 2 = payload
+  static bool cmd = false;
+  static bool trimNum = false;
+  static String trimDigits = "";
   static uint8_t mi = 0, li = 0;
   static uint32_t tlen = 0;
   static String payload = "";
@@ -1691,6 +2409,23 @@ void pollSerialReply() {
   while (Serial.available()) {
     uint8_t c = Serial.read();
     if (stage == 0) {
+      if (trimNum) {
+        // !T<digits> ends at the first non-digit, normally a newline. The
+        // same byte may start the next command, so re-arm on '!'.
+        if (c >= '0' && c <= '9') { trimDigits += (char)c; continue; }
+        if (trimDigits.length()) setTrimPercent(trimDigits.toInt());
+        trimNum = false;
+        trimDigits = "";
+        if (c == '!') cmd = true;
+        continue;
+      }
+      if (cmd) {
+        cmd = false;
+        if (c == 'T' || c == 't') { trimNum = true; trimDigits = ""; }
+        else handleSerialCmd((char)c);
+        continue;
+      }
+      if (c == '!') { cmd = true; continue; }
       if (c == magic[mi]) { mi++; if (mi == 6) { stage = 1; li = 0; tlen = 0; } }
       else mi = (c == magic[0]) ? 1 : 0;
     } else if (stage == 1) {
