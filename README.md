@@ -110,6 +110,12 @@ The robot always starts a fallback access point:
 
 It also joins the WiFi stored in NVS (or `include/wifi_config.h` on a fresh board) and retries in the background every 20 s. Open the page from a phone or laptop to drive with the on-screen buttons, start/stop autonomous mode, set the trim, and watch the live distance and heading values. The WiFi form on the page saves a new SSID/password to NVS, so no USB is needed to switch networks.
 
+The page also exposes every sensor separately for bench checks: front echo in microseconds and OK/OUT, left/right ToF in millimetres with timeout flags, IMU accel and gyro axes, yaw rate, gyro bias, wheel PWM, drive state, uptime and WiFi status. The **independent wheel tests** run one motor at a time for 0.9 s (left forward/reverse, right forward/reverse, both), and the OLED names the active test. `RETRY WIFI` and `REBOOT` are on the same page, so once this firmware is installed the robot does not need a USB cable for tuning.
+
+Raw JSON is at `http://<robot-ip>/sensors`; wheel tests are `GET /test?wheel=1..4` or `/test?both=f|b`.
+
+If the phone hotspot is hidden, the ESP32 scan cannot see its SSID. Unhide it in the phone's hotspot settings, or type the exact SSID/password into the WiFi form. The robot keeps the fallback AP up and retries every 20 s.
+
 Once this firmware is installed, future flashes can go over WiFi:
 
 ```
@@ -153,7 +159,7 @@ Working:
 
 Needs work:
 - Real-maze validation of the motor-side fix and learned trim
-- Right motor (channel B) does not drive forward; check BIN1/GPIO 14 and the driver solder joints
+- Wheel balance/traction: the chassis veers without trim; tune on open floor
 - Better neural training data (the teacher is still pretty simple)
 - Cleaner laptop page (one decision every 2 s is slow)
 
