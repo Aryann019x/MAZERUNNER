@@ -29,6 +29,9 @@
 #ifndef OTA_PASS
 #define OTA_PASS "mazerunner"
 #endif
+#ifndef WIFI_CHANNEL
+#define WIFI_CHANNEL 0
+#endif
 
 // IP of the laptop running server.py. Can be changed from the web page.
 #ifndef LAPTOP_HOST
@@ -1522,6 +1525,15 @@ void predictPosition(float secondsAhead, float &predX, float &predY) {
 // Connecting happens in the background. setupWifi() never blocks: the web
 // server is live on the fallback AP immediately, and the robot retries the
 // phone hotspot every 20 s until it joins.
+void wifiBegin() {
+#ifdef WIFI_BSSID
+  uint8_t b[6] = WIFI_BSSID;
+  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str(), WIFI_CHANNEL, b);
+#else
+  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+#endif
+}
+
 void setupWifi() {
   prefs.begin("maze", false);
   wifiSsid = prefs.isKey("ssid") ? prefs.getString("ssid", WIFI_SSID) : String(WIFI_SSID);
@@ -1552,7 +1564,7 @@ void setupWifi() {
   Serial.println("ota ready (AP or STA)");
 
   if (wifiSsid.length() && wifiSsid != "YOUR_WIFI_NAME") {
-    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    wifiBegin();
     Serial.printf("wifi: joining '%s'...\n", wifiSsid.c_str());
     wifiRetryAt = millis() + 20000;
   }
@@ -1587,7 +1599,7 @@ void wifiLoop() {
     if (wifiSsid.length() && millis() >= wifiRetryAt) {
       wifiRetryAt = millis() + 20000;
       Serial.printf("wifi retry '%s' (status %d)\n", wifiSsid.c_str(), st);
-      WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+      wifiBegin();
     }
   }
 }
@@ -2058,12 +2070,12 @@ void handleWebWifi() {
     prefs.putString("pass", wifiPass);
     prefs.end();
     WiFi.disconnect();
-    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    wifiBegin();
     wifiRetryAt = millis() + 20000;
     Serial.printf("wifi config: '%s'\n", wifiSsid.c_str());
   } else if (webServer.hasArg("retry")) {
     WiFi.disconnect();
-    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    wifiBegin();
     wifiRetryAt = millis() + 20000;
     Serial.printf("wifi retry button: '%s'\n", wifiSsid.c_str());
   }
@@ -2551,7 +2563,7 @@ void handleSerialCmd(char c) {
       WiFi.scanDelete();
       WiFi.mode(WIFI_AP_STA);
       WiFi.softAP(AP_SSID, AP_PASS);
-      WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+      wifiBegin();
       wifiRetryAt = millis() + 20000;
       break;
     }
