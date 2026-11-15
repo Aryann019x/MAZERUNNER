@@ -127,6 +127,10 @@ VL53L0X sensorRight;
 float distanceFront = -1;
 uint16_t distLeft = 65535;
 uint16_t distRight = 65535;
+unsigned long frontEchoUs = 0;
+bool frontEchoValid = false;
+float lastAx = 0, lastAy = 0, lastAz = 0;
+float lastGx = 0, lastGy = 0, lastGz = 0;
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 Adafruit_NeoPixel pixels(NEOPIXEL_NUM, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
@@ -212,6 +216,12 @@ unsigned long straightTestStart = 0;
 float straightTestHeading = 0;
 int straightTestPwm = 100;
 
+// One-wheel test (!1..!4): isolates motor vs driver vs traction.
+int wheelTestId = 0;
+unsigned long wheelTestStart = 0;
+float wheelTestHeading = 0;
+const int WHEEL_TEST_PWM = 120;
+
 // TUNE THESE: run moveForward(forwardSpeed,forwardSpeed) for exactly 2s on a
 // known-length straight run, measure distance traveled in mm, divide by 2.
 // Repeat for backward. These placeholders are almost certainly wrong for your robot.
@@ -221,6 +231,16 @@ const float SPEED_CAL_PWM = 150.0; // speed constants were measured at this PWM
 
 enum DriveState { DRIVE_STOPPED, DRIVE_FORWARD, DRIVE_BACKWARD, DRIVE_TURNING };
 DriveState driveState = DRIVE_STOPPED;
+
+const char* driveStateName() {
+  switch (driveState) {
+    case DRIVE_STOPPED: return "stop";
+    case DRIVE_FORWARD: return "fwd";
+    case DRIVE_BACKWARD: return "back";
+    case DRIVE_TURNING: return "turn";
+  }
+  return "?";
+}
 
 // Neural page state
 static float nnOutL = 0, nnOutR = 0;
@@ -263,8 +283,10 @@ String jsonField(const String& js, const char* key);
 String escJson(const String& s);
 void ultrasonicHybridDrive();
 void autoReset();
-void startStraightTest(int pwm);
+void startStraightTest(int pwm, bool forward = true);
 void straightTestUpdate();
+void startWheelTest(int id);
+void wheelTestUpdate();
 void saveDriveInvert();
 void sensorPowerDown(int pin);
 void sensorPowerUp(int pin);
@@ -411,6 +433,8 @@ void loop() {
 
   if (webHoldDir != 'S') {
     webDriveApply();
+  } else if (wheelTestId) {
+    wheelTestUpdate();
   } else if (straightTestActive) {
     straightTestUpdate();
   } else if(currentPage == 1) {
@@ -890,7 +914,9 @@ void readUltrasonic() {
   // Timeout reduced from 30000us to 8000us (~1.7m range, plenty for obstacle
   // avoidance) so a "nothing in range" reading doesn't stall the loop for 30ms.
   unsigned long duration = pulseIn(ULTRASONIC_ECHO_PIN, HIGH, 8000);
-  distanceFront = (duration > 0) ? (duration / 2.0) / 29.1 : -1;
+  frontEchoUs = duration;
+  frontEchoValid = (duration > 0);
+  distanceFront = frontEchoValid ? (duration / 2.0) / 29.1 : -1;
 }
 
 // -------------------- Autonomous maze drive --------------------
@@ -964,16 +990,18 @@ void autoReset() {
   autoTurnWindowStart = millis();
 }
 
-void startStraightTest(int pwm) {
+void startStraightTest(int pwm, bool forward) {
   stopMotors();
   straightTestPwm = constrain(pwm, 60, 160);
   currentPage = 0;
   straightTestActive = true;
   straightTestStart = millis();
   straightTestHeading = pose.heading;
-  moveForward(straightTestPwm, straightTestPwm);
+  if (forward) moveForward(straightTestPwm, straightTestPwm);
+  else moveBackward(straightTestPwm, straightTestPwm);
   straightCmd = false; // keep the trim learner out of the measurement
-  Serial.printf("STRAIGHT start pwm=%d H=%.1f\n", straightTestPwm, straightTestHeading);
+  Serial.printf("STRAIGHT start pwm=%d %s H=%.1f\n", straightTestPwm,
+                forward ? "fwd" : "back", straightTestHeading);
 }
 
 void straightTestUpdate() {
@@ -984,6 +1012,35 @@ void straightTestUpdate() {
   readUltrasonic();
   Serial.printf("STRAIGHT end dh=%.1f F=%.1f BAL=%.3f\n",
                 wrap180(pose.heading - straightTestHeading), distanceFront, motorBalance);
+}
+
+void startWheelTest(int id) {
+  stopMotors();
+  currentPage = 0;
+  wheelTestId = id;
+  wheelTestStart = millis();
+  wheelTestHeading = pose.heading;
+  const char *label = "?";
+  switch (id) {
+    case 1: setWheels(-WHEEL_TEST_PWM, 0); label = "left fwd"; break;
+    case 2: setWheels(WHEEL_TEST_PWM, 0); label = "left rev"; break;
+    case 3: setWheels(0, -WHEEL_TEST_PWM); label = "right fwd"; break;
+    case 4: setWheels(0, WHEEL_TEST_PWM); label = "right rev"; break;
+    default: wheelTestId = 0; return;
+  }
+  showWrapped("WHEEL TEST", String(id) + " " + label);
+  Serial.printf("WHEELTEST start %d %s\n", id, label);
+}
+
+void wheelTestUpdate() {
+  if (!wheelTestId) return;
+  if (millis() - wheelTestStart < 900) return;
+  stopMotors();
+  readUltrasonic();
+  Serial.printf("WHEELTEST end %d dh=%.1f F=%.1f L=%u R=%u\n", wheelTestId,
+                wrap180(pose.heading - wheelTestHeading), distanceFront, distLeft, distRight);
+  wheelTestId = 0;
+  showWelcomePage();
 }
 
 void startAutoTurn(bool ccw) {
@@ -1297,7 +1354,7 @@ void loadMotorBalance() {
   motorBalance = prefs.isKey("balance") ? prefs.getFloat("balance", 1.0f) : 1.0f;
   driveInvert = prefs.isKey("invert") ? prefs.getBool("invert", false) : true;
   prefs.end();
-  motorBalance = constrain(motorBalance, 0.75f, 1.25f);
+  motorBalance = constrain(motorBalance, 0.50f, 1.60f);
   Serial.printf("motor balance: %.3f\n", motorBalance);
   Serial.printf("drive invert: %s\n", driveInvert ? "on" : "off");
 }
@@ -1400,6 +1457,12 @@ void updatePose() {
 
   sensors_event_t a, g, t;
   mpu.getEvent(&a, &g, &t);
+  lastAx = a.acceleration.x;
+  lastAy = a.acceleration.y;
+  lastAz = a.acceleration.z;
+  lastGx = g.gyro.x * 180.0f / PI;
+  lastGy = g.gyro.y * 180.0f / PI;
+  lastGz = g.gyro.z * 180.0f / PI;
   float yawRateDegPerSec = (g.gyro.z * 180.0 / PI) - gyroZBiasDegPerSec;
   gyroYawRate = yawRateDegPerSec;
   pose.heading += yawRateDegPerSec * dt;
@@ -1409,7 +1472,8 @@ void updatePose() {
   // Straight command + non-zero yaw = the wheels are not matched. Integrate
   // the error over a second and trim the left side a little. Slow on
   // purpose: a bump or a single bad gyro sample shouldn't move the value.
-  if (straightCmd && driveState == DRIVE_FORWARD) {
+  if (straightCmd && driveState == DRIVE_FORWARD &&
+      webHoldDir == 'S' && !straightTestActive && !wheelTestId) {
     trimYawSum += yawRateDegPerSec * dt;
     trimRunTime += dt;
     if (trimRunTime >= 1.0f) {
@@ -1745,6 +1809,12 @@ button.auto.stop{background:#2a1517;border-color:#7a2a2e;color:#ff8b8b}
 .row button{flex:1;padding:13px;font-size:14px}
 .foot{color:var(--dim);font-size:11px;margin-top:16px;line-height:1.5}
 input{width:100%;margin:5px 0;padding:11px;border-radius:9px;border:1px solid var(--line);background:#0f151c;color:var(--fg);font-size:15px}
+.diag{display:grid;grid-template-columns:1fr 1fr;gap:7px 14px;margin-top:8px;font-size:13px}
+.diag div{display:flex;justify-content:space-between;gap:8px;border-bottom:1px solid #1d2530;padding-bottom:4px}
+.diag span{color:var(--dim)}
+.diag b{font-weight:600;font-variant-numeric:tabular-nums;text-align:right}
+.row4{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px}
+.row4 button{padding:11px 4px;font-size:12px}
 code{color:var(--accent)}
 </style></head><body>
 <h1>MAZERUNNER</h1>
@@ -1759,6 +1829,22 @@ code{color:var(--accent)}
 
 <div class="tile wide"><div class="k">MODE</div><div class="v" id="mode" style="font-size:18px">manual</div>
 <div class="u" id="meta">trim --</div></div>
+
+<div class="tile wide"><div class="k">LIVE SENSOR DIAGNOSTICS</div>
+<div class="diag">
+  <div><span>front echo</span><b id="d_fus">--</b></div>
+  <div><span>front state</span><b id="d_fok">--</b></div>
+  <div><span>left ToF</span><b id="d_lok">--</b></div>
+  <div><span>right ToF</span><b id="d_rok">--</b></div>
+  <div><span>yaw rate</span><b id="d_yaw">--</b></div>
+  <div><span>gyro bias</span><b id="d_bias">--</b></div>
+  <div><span>accel x/y/z</span><b id="d_acc">--</b></div>
+  <div><span>gyro x/y/z</span><b id="d_gyr">--</b></div>
+  <div><span>wheel PWM</span><b id="d_pwm">--</b></div>
+  <div><span>drive state</span><b id="d_drive">--</b></div>
+  <div><span>test</span><b id="d_test">--</b></div>
+  <div><span>wifi</span><b id="d_wifi">--</b></div>
+</div></div>
 
 <div class="pad">
   <div></div><button id="f">&#9650;</button><div></div>
@@ -1779,13 +1865,32 @@ code{color:var(--accent)}
   <button id="inv">SWAP F/B</button>
 </div>
 
+<div class="tile wide"><div class="k">INDEPENDENT WHEEL TESTS (0.9 s)</div>
+<div class="row4">
+  <button data-wheel="1">L fwd</button>
+  <button data-wheel="2">L rev</button>
+  <button data-wheel="3">R fwd</button>
+  <button data-wheel="4">R rev</button>
+</div>
+<div class="row4">
+  <button data-both="f">BOTH fwd</button>
+  <button data-both="b">BOTH rev</button>
+  <button id="wstop" class="stop">STOP</button>
+</div>
+<div class="u" style="margin-top:8px">Each wheel runs alone. Watch which wheel spins and which way; the OLED names the active test.</div>
+</div>
+
 <div class="tile wide"><div class="k">WIFI</div>
 <div class="u" id="wifi">not connected</div>
 <form action="/wifi" method="post" style="margin-top:8px">
-  <input name="ssid" placeholder="network name (SSID)" autocomplete="off" autocapitalize="none" spellcheck="false">
-  <input name="pass" type="password" placeholder="password" autocomplete="off">
+  <input id="ssid" name="ssid" placeholder="network name (SSID)" autocomplete="off" autocapitalize="none" spellcheck="false">
+  <input id="pass" name="pass" type="password" placeholder="password" autocomplete="off">
   <button type="submit" class="auto" style="width:100%">SAVE &amp; CONNECT</button>
 </form>
+<div class="row">
+  <button id="wretry">RETRY WIFI</button>
+  <button id="reboot" class="stop">REBOOT</button>
+</div>
 <div class="u" style="margin-top:8px">The robot joins this network in the background and stays on the fallback AP until it succeeds.</div>
 </div>
 
@@ -1816,10 +1921,15 @@ bindHold('f','F');bindHold('b','B');bindHold('l','L');bindHold('r','R');
 q('s').addEventListener('pointerdown',e=>{e.preventDefault();stopAll();});
 q('auto').addEventListener('pointerdown',e=>{e.preventDefault();stopAll();send('/auto?on=1');});
 q('autostop').addEventListener('pointerdown',e=>{e.preventDefault();stopAll();send('/auto?on=0');});
-q('tm').onclick=()=>send('/trim?step=-2');
-q('tp').onclick=()=>send('/trim?step=2');
+q('tm').onclick=()=>send('/trim?step=-5');
+q('tp').onclick=()=>send('/trim?step=5');
 q('tr').onclick=()=>send('/trim?reset=1');
 q('inv').onclick=()=>send('/invert');
+document.querySelectorAll('[data-wheel]').forEach(b=>b.onclick=()=>send('/test?wheel='+b.dataset.wheel));
+document.querySelectorAll('[data-both]').forEach(b=>b.onclick=()=>send('/test?both='+b.dataset.both));
+q('wstop').onclick=()=>stopAll();
+q('wretry').onclick=()=>send('/wifi?retry=1');
+q('reboot').onclick=()=>{if(confirm('Reboot the robot?'))send('/reboot');};
 window.addEventListener('blur',stopAll);
 window.addEventListener('pagehide',()=>{navigator.sendBeacon('/drive?dir=S');});
 async function poll(){
@@ -1827,7 +1937,9 @@ async function poll(){
     const r=await fetch('/sensors',{cache:'no-store'});
     const j=await r.json();
     q('dot').classList.add('on');
-    q('link').textContent='online  '+j.ip+'  '+j.rssi+' dBm';
+    q('link').textContent=j.wifi_connected
+      ? ('online  '+j.ip+'  '+j.rssi+' dBm')
+      : ('online  AP only  '+j.ap_ip);
     q('front').textContent=j.front>0?Math.round(j.front):'out';
     q('left').textContent=j.left===65535?'out':j.left;
     q('right').textContent=j.right===65535?'out':j.right;
@@ -1836,6 +1948,18 @@ async function poll(){
     q('meta').textContent='trim '+j.trim.toFixed(1)+'%   speed '+j.speed+'   '+j.ip;
     q('inv').textContent='SWAP F/B  ('+(j.inv?'swapped':'normal')+')';
     q('wifi').textContent='network: '+j.ssid+'   address: '+j.ip;
+    q('d_fus').textContent=j.front_ok?j.front_us+' us':'no echo';
+    q('d_fok').textContent=j.front_ok?'OK':'OUT';
+    q('d_lok').textContent=j.left_ok?(j.left+' mm'):'TIMEOUT';
+    q('d_rok').textContent=j.right_ok?(j.right+' mm'):'TIMEOUT';
+    q('d_yaw').textContent=j.yaw.toFixed(1)+' deg/s';
+    q('d_bias').textContent=j.bias.toFixed(2)+' deg/s';
+    q('d_acc').textContent=j.ax.toFixed(2)+' '+j.ay.toFixed(2)+' '+j.az.toFixed(2);
+    q('d_gyr').textContent=j.gx.toFixed(1)+' '+j.gy.toFixed(1)+' '+j.gz.toFixed(1);
+    q('d_pwm').textContent=j.pwm_l+' / '+j.pwm_r;
+    q('d_drive').textContent=j.drive;
+    q('d_test').textContent=j.wheel_test?('wheel '+j.wheel_test):(j.straight?'straight':'idle');
+    q('d_wifi').textContent=j.wifi_connected?('STA '+j.rssi+' dBm'):('AP '+j.ap_ip);
   }catch(e){
     q('dot').classList.remove('on');
     q('link').textContent='offline - robot not reachable';
@@ -1882,10 +2006,14 @@ void handleWebDrive() {
   char c = toupper(d[0]);
   if (c == 'S') {
     webHoldDir = 'S';
+    wheelTestId = 0;
+    straightTestActive = false;
     stopMotors();
   } else if (c == 'F' || c == 'B' || c == 'L' || c == 'R') {
     webHoldDir = c;
     webHoldLast = millis();
+    wheelTestId = 0;
+    straightTestActive = false;
     if (currentPage == 3) autoState = AUTO_HALT;
     currentPage = 0;
     webDriveApply();
@@ -1896,6 +2024,8 @@ void handleWebDrive() {
 void handleWebAuto() {
   bool on = webServer.arg("on") == "1";
   webHoldDir = 'S';
+  wheelTestId = 0;
+  straightTestActive = false;
   stopMotors();
   if (on) {
     currentPage = 3;
@@ -1931,9 +2061,38 @@ void handleWebWifi() {
     WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
     wifiRetryAt = millis() + 20000;
     Serial.printf("wifi config: '%s'\n", wifiSsid.c_str());
+  } else if (webServer.hasArg("retry")) {
+    WiFi.disconnect();
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    wifiRetryAt = millis() + 20000;
+    Serial.printf("wifi retry button: '%s'\n", wifiSsid.c_str());
   }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
+}
+
+void handleWebTest() {
+  webHoldDir = 'S';
+  wheelTestId = 0;
+  straightTestActive = false;
+  stopMotors();
+  int id = webServer.arg("wheel").toInt();
+  if (id >= 1 && id <= 4) {
+    startWheelTest(id);
+  } else {
+    String both = webServer.arg("both");
+    if (both == "f") startStraightTest(130, true);
+    else if (both == "b") startStraightTest(130, false);
+  }
+  webServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleWebReboot() {
+  webHoldDir = 'S';
+  stopMotors();
+  webServer.send(200, "application/json", "{\"reboot\":true}");
+  delay(200);
+  ESP.restart();
 }
 
 void handleWebCmd() {
@@ -1956,11 +2115,11 @@ void handleWebTrim() {
     saveMotorBalance();
   } else if (webServer.hasArg("step")) {
     float pct = (motorBalance - 1.0f) * 100.0f + webServer.arg("step").toFloat();
-    motorBalance = constrain(1.0f + pct / 100.0f, 0.75f, 1.25f);
+    motorBalance = constrain(1.0f + pct / 100.0f, 0.50f, 1.60f);
     saveMotorBalance();
   } else if (webServer.hasArg("b")) {
     float pct = webServer.arg("b").toFloat();
-    motorBalance = constrain(1.0f + pct / 100.0f, 0.75f, 1.25f);
+    motorBalance = constrain(1.0f + pct / 100.0f, 0.50f, 1.60f);
     saveMotorBalance();
   }
   webServer.sendHeader("Location", "/");
@@ -2004,24 +2163,51 @@ void handleWebTarget() {
   webServer.send(303);
 }
 
-void handleWebSensors() {
+String buildTelemetryJson() {
   uint16_t l = sensorLeft.readRangeContinuousMillimeters();
+  bool lt = sensorLeft.timeoutOccurred();
   uint16_t r = sensorRight.readRangeContinuousMillimeters();
-  if (sensorLeft.timeoutOccurred()) l = 65535;
-  if (sensorRight.timeoutOccurred()) r = 65535;
+  bool rt = sensorRight.timeoutOccurred();
+  if (lt) l = 65535;
+  if (rt) r = 65535;
   readUltrasonic();
-  String j = "{\"front\":" + String(distanceFront, 1) + ",\"left\":" + String(l) +
-             ",\"right\":" + String(r) +
-             ",\"heading\":" + String(pose.heading, 1) +
-             ",\"trim\":" + String((motorBalance - 1.0f) * 100.0f, 2) +
-             ",\"speed\":" + String(webSpeed) +
-             ",\"auto\":" + String(currentPage == 3 ? "true" : "false") +
-             ",\"state\":\"" + autoStateName() + "\"" +
-             ",\"inv\":" + String(driveInvert ? "true" : "false") +
-             ",\"ssid\":\"" + wifiSsid + "\"" +
-             ",\"ip\":\"" + botIP + "\"" +
-             ",\"rssi\":" + String(WiFi.RSSI()) + "}";
-  webServer.send(200, "application/json", j);
+
+  String j = "{";
+  j += "\"ms\":" + String(millis()) + ",";
+  j += "\"front\":" + String(distanceFront, 1) + ",";
+  j += "\"front_us\":" + String(frontEchoUs) + ",";
+  j += "\"front_ok\":" + String(frontEchoValid ? "true" : "false") + ",";
+  j += "\"left\":" + String(l) + ",\"left_ok\":" + String(lt ? "false" : "true") + ",";
+  j += "\"right\":" + String(r) + ",\"right_ok\":" + String(rt ? "false" : "true") + ",";
+  j += "\"heading\":" + String(pose.heading, 1) + ",";
+  j += "\"yaw\":" + String(gyroYawRate, 1) + ",";
+  j += "\"bias\":" + String(gyroZBiasDegPerSec, 2) + ",";
+  j += "\"ax\":" + String(lastAx, 2) + ",\"ay\":" + String(lastAy, 2) +
+       ",\"az\":" + String(lastAz, 2) + ",";
+  j += "\"gx\":" + String(lastGx, 1) + ",\"gy\":" + String(lastGy, 1) +
+       ",\"gz\":" + String(lastGz, 1) + ",";
+  j += "\"pwm_l\":" + String(pwmLeft) + ",\"pwm_r\":" + String(pwmRight) + ",";
+  j += "\"drive\":\"" + String(driveStateName()) + "\",";
+  j += "\"trim\":" + String((motorBalance - 1.0f) * 100.0f, 2) + ",";
+  j += "\"speed\":" + String(webSpeed) + ",";
+  j += "\"inv\":" + String(driveInvert ? "true" : "false") + ",";
+  j += "\"page\":" + String(currentPage) + ",";
+  j += "\"auto\":" + String(currentPage == 3 ? "true" : "false") + ",";
+  j += "\"state\":\"" + String(autoStateName()) + "\",";
+  j += "\"wheel_test\":" + String(wheelTestId) + ",";
+  j += "\"straight\":" + String(straightTestActive ? "true" : "false") + ",";
+  j += "\"ssid\":\"" + wifiSsid + "\",";
+  j += "\"ip\":\"" + botIP + "\",";
+  j += "\"ap_ip\":\"" + apIP + "\",";
+  j += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  j += "\"wifi_status\":" + String((int)WiFi.status()) + ",";
+  j += "\"wifi_connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  j += "\"uptime\":" + String(millis() / 1000) + "}";
+  return j;
+}
+
+void handleWebSensors() {
+  webServer.send(200, "application/json", buildTelemetryJson());
 }
 
 void setupWeb() {
@@ -2031,6 +2217,8 @@ void setupWeb() {
   webServer.on("/auto", handleWebAuto);
   webServer.on("/invert", handleWebInvert);
   webServer.on("/wifi", handleWebWifi);
+  webServer.on("/test", handleWebTest);
+  webServer.on("/reboot", handleWebReboot);
   webServer.on("/speed", handleWebSpeed);
   webServer.on("/trim", handleWebTrim);
   webServer.on("/sensors", handleWebSensors);
@@ -2333,12 +2521,18 @@ void handleSerialCmd(char c) {
       Serial.println("trim reset: 1.000");
       break;
     case 'S': case 's':
-      startStraightTest(130);
+      startStraightTest(130, true);
       break;
     case 'I': case 'i':
       driveInvert = !driveInvert;
       saveDriveInvert();
       Serial.printf("drive invert: %s\n", driveInvert ? "on" : "off");
+      break;
+    case '1': case '2': case '3': case '4':
+      startWheelTest(c - '0');
+      break;
+    case 'J': case 'j':
+      Serial.println(buildTelemetryJson());
       break;
     case 'W': case 'w': {
       wifiRetryAt = millis() + 60000;
@@ -2391,7 +2585,7 @@ void handleSerialCmd(char c) {
 // Manual wheel trim from the serial console. The gyro learner needs a long
 // straight run and auto steers every cycle, so bench tuning sets it by hand.
 void setTrimPercent(int pct) {
-  pct = constrain(pct, 50, 150);
+  pct = constrain(pct, 50, 160);
   motorBalance = pct / 100.0f;
   saveMotorBalance();
   Serial.printf("trim set: %.3f\n", motorBalance);
