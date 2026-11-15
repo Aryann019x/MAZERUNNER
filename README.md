@@ -96,9 +96,28 @@ The RL trainer only overwrites `include/nn_policy.h` when the candidate beats th
 
 ### Motor trim
 
-The two gear motors never run at exactly the same speed, so a straight command slowly drifts. While the robot is driving straight, the firmware averages the gyro yaw rate over a second and nudges a scale factor on the **left** wheel (motor B) until the heading stops drifting. Motor A is the physical right wheel and motor B is the left one. The value is saved in NVS and shown on the Pose page.
+The two gear motors never run at exactly the same speed, so a straight command slowly drifts. While the robot is driving straight, the firmware averages the gyro yaw rate over a second and nudges a scale factor on the **left** wheel (motor A) until the heading stops drifting. Motor A is the physical left wheel and motor B is the right one. The value is saved in NVS and shown on the Pose page.
 
-The web page can reset it, set it by hand, or run a calibration: five short straight bursts in open space (about 1.2 m ahead is enough), re-checking the gyro bias first. Normal driving keeps fine-tuning it afterwards.
+The web page can reset it or set it by hand in 2% steps, and the serial console accepts `!T109` for 1.09. The old five-burst calibration is still available at `/trim?cal=1`, but it needs 1.2 m of clear floor.
+
+### Wireless control and OTA
+
+The robot always starts a fallback access point:
+
+- SSID: `MazeRunner`
+- Password: `mazerunner123`
+- Page: `http://192.168.4.1`
+
+It also joins the WiFi stored in NVS (or `include/wifi_config.h` on a fresh board) and retries in the background every 20 s. Open the page from a phone or laptop to drive with the on-screen buttons, start/stop autonomous mode, set the trim, and watch the live distance and heading values. The WiFi form on the page saves a new SSID/password to NVS, so no USB is needed to switch networks.
+
+Once this firmware is installed, future flashes can go over WiFi:
+
+```
+pio run -e ota -t upload
+pio run -e ota -t upload --upload-port 192.168.4.1   # fallback AP
+```
+
+OTA uses the hostname `mazerunner.local` and the password `mazerunner`.
 
 ### Laptop bridge
 
@@ -116,7 +135,7 @@ Requires [PlatformIO](https://platformio.org/).
 
 ```
 pio run                  # compile
-pio run -t upload        # flash to board
+pio run -t upload        # flash to board over USB
 pio device monitor       # serial monitor at 115200
 ```
 
@@ -134,6 +153,7 @@ Working:
 
 Needs work:
 - Real-maze validation of the motor-side fix and learned trim
+- Right motor (channel B) does not drive forward; check BIN1/GPIO 14 and the driver solder joints
 - Better neural training data (the teacher is still pretty simple)
 - Cleaner laptop page (one decision every 2 s is slow)
 
