@@ -96,7 +96,7 @@ The RL trainer only overwrites `include/nn_policy.h` when the candidate beats th
 
 ### Motor trim
 
-The two gear motors never run at exactly the same speed, so a straight command slowly drifts. While the robot is driving straight, the firmware averages the gyro yaw rate over a second and nudges a scale factor on the **left** wheel (motor A) until the heading stops drifting. Motor A is the physical left wheel and motor B is the right one. The value is saved in NVS and shown on the Pose page.
+The two gear motors never run at exactly the same speed, so a straight command slowly drifts. While the robot is driving straight, the firmware averages the gyro yaw rate over a second and nudges a scale factor on the **left** wheel (motor B) until the heading stops drifting. Motor A is the physical right wheel and motor B is the left one. The value is saved in NVS and shown on the Pose page.
 
 The web page can reset it or set it by hand in 2% steps, and the serial console accepts `!T109` for 1.09. The old five-burst calibration is still available at `/trim?cal=1`, but it needs 1.2 m of clear floor.
 

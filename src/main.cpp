@@ -608,11 +608,11 @@ void updateEyesWithMPU() {
 }
 
 // -------------------- Motors --------------------
-// Motor A is the physical LEFT wheel, motor B is the RIGHT one. The motor
+// Motor A is the physical RIGHT wheel, motor B is the LEFT one. The motor
 // leads are also wired opposite to the TB6612 convention, so every direction
 // write goes through the MOTOR_FWD* and MOTOR_REV* levels defined above. The
-// learned trim scales the left (A) side; if the sides are ever swapped, the
-// robot will curve away instead of straightening out.
+// learned trim scales the physical left (B) side; if the sides are ever
+// swapped, the robot will curve away instead of straightening out.
 int balancedLeft(int pwm) {
   return constrain((int)lroundf(pwm * motorBalance), 0, 255);
 }
@@ -620,8 +620,8 @@ int balancedLeft(int pwm) {
 void moveForward(uint8_t left, uint8_t right) {
   digitalWrite(STBY, HIGH);
   setTranslateDir(true);
-  ledcWrite(pwmChannelA, balancedLeft(left));
-  ledcWrite(pwmChannelB, right);
+  ledcWrite(pwmChannelA, right);
+  ledcWrite(pwmChannelB, balancedLeft(left));
   pwmLeft = balancedLeft(left);
   pwmRight = right;
   straightCmd = (left == right && left > 0);
@@ -631,8 +631,8 @@ void moveForward(uint8_t left, uint8_t right) {
 void moveBackward(uint8_t left, uint8_t right) {
   digitalWrite(STBY, HIGH);
   setTranslateDir(false);
-  ledcWrite(pwmChannelA, balancedLeft(left));
-  ledcWrite(pwmChannelB, right);
+  ledcWrite(pwmChannelA, right);
+  ledcWrite(pwmChannelB, balancedLeft(left));
   pwmLeft = balancedLeft(left);
   pwmRight = right;
   straightCmd = (left == right && left > 0);
@@ -642,17 +642,17 @@ void moveBackward(uint8_t left, uint8_t right) {
 void setSpinPins(bool ccw, uint8_t speed) {
   digitalWrite(STBY, HIGH);
   if (ccw) {
-    // Nose left: left wheel (A) back, right wheel (B) forward.
-    digitalWrite(AIN1, MOTOR_REV1);
-    digitalWrite(AIN2, MOTOR_REV2);
-    digitalWrite(BIN1, MOTOR_FWD1);
-    digitalWrite(BIN2, MOTOR_FWD2);
-  } else {
-    // Nose right: left wheel (A) forward, right wheel (B) back.
+    // Nose left: right wheel (A) forward, left wheel (B) back.
     digitalWrite(AIN1, MOTOR_FWD1);
     digitalWrite(AIN2, MOTOR_FWD2);
     digitalWrite(BIN1, MOTOR_REV1);
     digitalWrite(BIN2, MOTOR_REV2);
+  } else {
+    // Nose right: right wheel (A) back, left wheel (B) forward.
+    digitalWrite(AIN1, MOTOR_REV1);
+    digitalWrite(AIN2, MOTOR_REV2);
+    digitalWrite(BIN1, MOTOR_FWD1);
+    digitalWrite(BIN2, MOTOR_FWD2);
   }
   ledcWrite(pwmChannelA, speed);
   ledcWrite(pwmChannelB, speed);
@@ -660,11 +660,12 @@ void setSpinPins(bool ccw, uint8_t speed) {
 }
 
 // Starts a gyro-closed-loop spin. ccw = nose left (positive gyro yaw).
-// A is the left wheel and B is the right one. CCW means the right wheel goes
-// forward and the left goes backward; CW is the reverse. The MOTOR_FWD*/
-// MOTOR_REV* levels already account for this robot's reversed motor leads.
-// If the gyro ever sees the chassis rotating the wrong way, turnUpdate stops
-// the spin and raises turnFault instead of flipping directions mid-turn.
+// A is the physical right wheel and B is the left one. CCW means the right
+// wheel goes forward and the left goes backward; CW is the reverse. The
+// MOTOR_FWD*/MOTOR_REV* levels already account for this robot's reversed
+// motor leads. If the gyro ever sees the chassis rotating the wrong way,
+// turnUpdate stops the spin and raises turnFault instead of flipping
+// directions mid-turn.
 void startTurn(bool ccw, uint8_t speed, float degrees) {
   setSpinPins(ccw, speed);
   straightCmd = false;
@@ -750,18 +751,18 @@ void stopMotors() {
 
 // Direct wheel speeds, negative = backwards. Used by the neural page where
 // the two sides move independently instead of the usual forward/turn calls.
-// A is the left motor and B is the right one.
+// A is the physical right motor and B is the left one.
 void setWheels(int left, int right) {
   left = constrain(left, -255, 255);
   right = constrain(right, -255, 255);
   int l = (left >= 0) ? balancedLeft(left) : -balancedLeft(-left);
   digitalWrite(STBY, HIGH);
-  digitalWrite(AIN1, l >= 0 ? MOTOR_FWD1 : MOTOR_REV1);
-  digitalWrite(AIN2, l >= 0 ? MOTOR_FWD2 : MOTOR_REV2);
-  digitalWrite(BIN1, right >= 0 ? MOTOR_FWD1 : MOTOR_REV1);
-  digitalWrite(BIN2, right >= 0 ? MOTOR_FWD2 : MOTOR_REV2);
-  ledcWrite(pwmChannelA, abs(l));
-  ledcWrite(pwmChannelB, abs(right));
+  digitalWrite(AIN1, right >= 0 ? MOTOR_FWD1 : MOTOR_REV1);
+  digitalWrite(AIN2, right >= 0 ? MOTOR_FWD2 : MOTOR_REV2);
+  digitalWrite(BIN1, l >= 0 ? MOTOR_FWD1 : MOTOR_REV1);
+  digitalWrite(BIN2, l >= 0 ? MOTOR_FWD2 : MOTOR_REV2);
+  ledcWrite(pwmChannelA, abs(right));
+  ledcWrite(pwmChannelB, abs(l));
   pwmLeft = abs(l);
   pwmRight = abs(right);
   straightCmd = (left == right && left != 0);
